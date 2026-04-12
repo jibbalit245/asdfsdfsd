@@ -1442,18 +1442,18 @@ __global__ void collide_interference_kernel(
     out.z = clamp01(clamp01(out.z) + (comp_rgb.z - clamp01(me.z)) * w);
     row_f4(px_nxt_base, px_nxt_pitch, y)[x] = out;
 }
-
-
+/*
    Rule:
-     exact complement (dh = π)         → ATTRACT (f = +1)
-     one shade off complement (dh≈π±σ) → REPEL   (f < 0)
-     same hue (dh ≈ 0)                 → neutral  (handled by gravity)
+     exact complement (dh = pi)          -> ATTRACT (f = +1)
+     one shade off complement (dh~pi+/-sigma) -> REPEL (f < 0)
+     same hue (dh ~ 0)                   -> neutral (handled by gravity)
    This creates three emergent behaviors from one rule:
      - Pairing: opposite colors lock in stable pairs
      - Blocking: a color flanked by its hue-neighbors repels its complement
      - Exclusion: a locked pair expels the partners' neighboring shades
    Force is applied as a hue rotation in HSV space, preserving saturation.
-   σ (sigma) controls the "one shade" width on the wheel — tunable as 'triad'. */
+   sigma controls the "one shade" width on the wheel, tunable as 'triad'.
+*/
 __global__ void complementary_neighbor_kernel(
     const void* px_cur_base, size_t px_cur_pitch,
     void*       px_nxt_base, size_t px_nxt_pitch,
