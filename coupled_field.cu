@@ -351,6 +351,7 @@ typedef struct {
     int snap_every;      /* write pixel PNG every N ticks (0 = use SNAPSHOT_PERIOD) */
     char snap_dir[512];  /* directory for PNG output (empty = current dir) */
     char resume_path[512];
+    char nca_weights_path[512]; /* pre-trained NCA checkpoint to load on startup */
     char quantum_log[512];
 } HostOptions;
 
@@ -2241,6 +2242,7 @@ static int parse_args(int argc, char** argv, HostOptions* opt) {
     opt->snap_every = 0;
     opt->snap_dir[0] = '\0';
     opt->resume_path[0] = '\0';
+    opt->nca_weights_path[0] = '\0';
     opt->quantum_log[0] = '\0';
 
     for (int i = 1; i < argc; ++i) {
@@ -2265,6 +2267,9 @@ static int parse_args(int argc, char** argv, HostOptions* opt) {
         } else if (!strcmp(argv[i], "--resume") && i + 1 < argc) {
             strncpy(opt->resume_path, argv[++i], sizeof(opt->resume_path) - 1);
             opt->resume_path[sizeof(opt->resume_path) - 1] = '\0';
+        } else if (!strcmp(argv[i], "--nca-weights") && i + 1 < argc) {
+            strncpy(opt->nca_weights_path, argv[++i], sizeof(opt->nca_weights_path) - 1);
+            opt->nca_weights_path[sizeof(opt->nca_weights_path) - 1] = '\0';
         }
     }
 
@@ -2278,6 +2283,56 @@ static void write_nca_weights(const char* path, const float* h_w, int n) {
     if (!f) return;
     fwrite(h_w, sizeof(float), (size_t)n, f);
     fclose(f);
+}
+
+/* NCA training checkpoint: weights + Adam first/second moments + step counter.
+   Format: 4-byte magic 0x4E434143 ("NCAC") | int32 n | int32 adam_t |
+           n floats w | n floats m | n floats v                              */
+static void write_nca_checkpoint(const char* path,
+                                  const float* h_w, const float* h_m,
+                                  const float* h_v, int adam_t, int n) {
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "nca_checkpoint: cannot open %s for write\n", path); return; }
+    uint32_t magic = 0x4E434143u;
+    int32_t  ni    = (int32_t)n;
+    int32_t  at    = (int32_t)adam_t;
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(&ni,    sizeof(ni),    1, f);
+    fwrite(&at,    sizeof(at),    1, f);
+    fwrite(h_w,    sizeof(float), (size_t)n, f);
+    fwrite(h_m,    sizeof(float), (size_t)n, f);
+    fwrite(h_v,    sizeof(float), (size_t)n, f);
+    fclose(f);
+}
+
+/* Returns 0 on success and fills h_w, h_m, h_v, *adam_t_out.
+   Returns -1 if the file is missing, corrupt, or has the wrong n. */
+static int load_nca_checkpoint(const char* path,
+                                float* h_w, float* h_m,
+                                float* h_v, int* adam_t_out, int n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    uint32_t magic = 0;
+    int32_t  ni    = 0;
+    int32_t  at    = 0;
+    if (fread(&magic, sizeof(magic), 1, f) != 1 ||
+        fread(&ni,    sizeof(ni),    1, f) != 1 ||
+        fread(&at,    sizeof(at),    1, f) != 1 ||
+        magic != 0x4E434143u || ni != (int32_t)n) {
+        fprintf(stderr, "nca_checkpoint: invalid or incompatible checkpoint %s\n", path);
+        fclose(f);
+        return -1;
+    }
+    if (fread(h_w, sizeof(float), (size_t)n, f) != (size_t)n ||
+        fread(h_m, sizeof(float), (size_t)n, f) != (size_t)n ||
+        fread(h_v, sizeof(float), (size_t)n, f) != (size_t)n) {
+        fprintf(stderr, "nca_checkpoint: truncated checkpoint %s\n", path);
+        fclose(f);
+        return -1;
+    }
+    *adam_t_out = (int)at;
+    fclose(f);
+    return 0;
 }
 
 typedef struct {
@@ -2651,9 +2706,13 @@ int main(int argc, char** argv) {
     if (ftell(f_nca) == 0) fprintf(f_nca, "tick,adam_step,nca_loss,nca_residual,grad_norm\n");
 
     float* nca_w = (float*)malloc(NCA_PARAMS * sizeof(float));
+    float* nca_m = (float*)malloc(NCA_PARAMS * sizeof(float));  /* host mirror of d_m */
+    float* nca_v = (float*)malloc(NCA_PARAMS * sizeof(float));  /* host mirror of d_v */
     float* nca_g = (float*)malloc(NCA_PARAMS * sizeof(float));
-    if (!nca_w || !nca_g) return 1;
+    if (!nca_w || !nca_m || !nca_v || !nca_g) return 1;
     memset(nca_g, 0, NCA_PARAMS * sizeof(float));
+    memset(nca_m, 0, NCA_PARAMS * sizeof(float));
+    memset(nca_v, 0, NCA_PARAMS * sizeof(float));
 
     /* He (Kaiming) initialization for ReLU layers.
        For a uniform distribution U[-a, a], variance = a²/3.  To achieve He's
@@ -2690,10 +2749,39 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_g, NCA_PARAMS * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_m, NCA_PARAMS * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_v, NCA_PARAMS * sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(d_w, nca_w, NCA_PARAMS * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemset(d_g, 0, NCA_PARAMS * sizeof(float)));
-    CHECK_CUDA(cudaMemset(d_m, 0, NCA_PARAMS * sizeof(float)));
-    CHECK_CUDA(cudaMemset(d_v, 0, NCA_PARAMS * sizeof(float)));
+
+    /* Load NCA checkpoint if requested (--nca-weights) or if a companion
+       nca_checkpoint_<tick>.bin exists alongside the --resume snapshot.
+       Priority: explicit --nca-weights arg > auto-discovered companion file. */
+    {
+        char ckpt_path[512] = "";
+        if (opt.nca_weights_path[0]) {
+            strncpy(ckpt_path, opt.nca_weights_path, sizeof(ckpt_path) - 1);
+        } else if (opt.resume_path[0]) {
+            /* Replace ".bin" suffix with "_nca.bin" to find the companion file.
+               E.g. "checkpoint_65536.bin" → "checkpoint_65536_nca.bin"        */
+            strncpy(ckpt_path, opt.resume_path, sizeof(ckpt_path) - 1);
+            char* dot = strrchr(ckpt_path, '.');
+            if (dot) *dot = '\0';
+            strncat(ckpt_path, "_nca.bin", sizeof(ckpt_path) - strlen(ckpt_path) - 1);
+        }
+        int loaded = 0;
+        if (ckpt_path[0]) {
+            if (load_nca_checkpoint(ckpt_path, nca_w, nca_m, nca_v, &adam_t, NCA_PARAMS) == 0) {
+                fprintf(stderr, "[nca] loaded checkpoint %s (adam_t=%d)\n", ckpt_path, adam_t);
+                loaded = 1;
+            } else if (opt.nca_weights_path[0]) {
+                fprintf(stderr, "[nca] WARNING: --nca-weights %s failed to load; starting fresh\n",
+                        ckpt_path);
+            }
+        }
+        (void)loaded;
+    }
+
+    CHECK_CUDA(cudaMemcpy(d_w, nca_w, NCA_PARAMS * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_m, nca_m, NCA_PARAMS * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_v, nca_v, NCA_PARAMS * sizeof(float), cudaMemcpyHostToDevice));
 
     unsigned long long* d_active = NULL;
     float* d_wave_energy = NULL;
@@ -3160,6 +3248,22 @@ int main(int argc, char** argv) {
             char nname[128];
             snprintf(nname, sizeof(nname), "nca_weights_%d.bin", tick);
             write_nca_weights(nname, nca_w, NCA_PARAMS);
+
+            /* Full NCA checkpoint (weights + Adam moments + step counter) so
+               a resume with --resume checkpoint_NNN.bin + auto-discovered
+               companion _nca.bin restores training state exactly. */
+            CHECK_CUDA(cudaMemcpy(nca_m, d_m, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(nca_v, d_v, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+            char cname[128];
+            snprintf(cname, sizeof(cname), "checkpoint_%d_nca.bin", tick);
+            write_nca_checkpoint(cname, nca_w, nca_m, nca_v, adam_t, NCA_PARAMS);
+
+            /* Substrate state checkpoint — allows resuming physics too */
+            char sname[128];
+            snprintf(sname, sizeof(sname), "checkpoint_%d.bin", tick);
+            save_snapshot(sname, &pool, (uint64_t)tick);
+            fprintf(stderr, "[checkpoint] tick=%d  substrate → %s  nca → %s\n",
+                    tick, sname, cname);
         }
 
         /* Stats + observability */
@@ -3286,11 +3390,21 @@ int main(int argc, char** argv) {
 
     save_snapshot("snapshot_final.bin", &pool, (uint64_t)opt.ticks);
 
+    /* Final NCA checkpoint — same naming convention as periodic ones so
+       --resume snapshot_final.bin auto-discovers snapshot_final_nca.bin */
+    CHECK_CUDA(cudaMemcpy(nca_w, d_w, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(nca_m, d_m, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(nca_v, d_v, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+    write_nca_checkpoint("snapshot_final_nca.bin", nca_w, nca_m, nca_v, adam_t, NCA_PARAMS);
+    fprintf(stderr, "[final] substrate → snapshot_final.bin  nca → snapshot_final_nca.bin\n");
+
     fclose(f_act); fclose(f_energy); fclose(f_de); fclose(f_nca);
 
     free(h_edges);
     free(natural_log);
     free(nca_w);
+    free(nca_m);
+    free(nca_v);
     free(nca_g);
 
     cudaFree(d_src_views);
