@@ -310,7 +310,19 @@ static void init_freq_table(void) {
 #define BASE_KWTP 0.020f
 #define BASE_FEEDBACK 0.00005f
 #define BASE_GRAVITY 0.006f     /* increased: faster hue-cluster accumulation */
-#define BASE_LR 0.0001f
+#define BASE_LR 0.001f          /* Adam default — much higher than SGD needs */
+
+/* Adam hyperparameters — kept fixed (not tunable) */
+#define ADAM_BETA1 0.9f
+#define ADAM_BETA2 0.999f
+#define ADAM_EPS   1.0e-8f
+
+/* NCA gradient accumulation: run NCA forward/backward every NCA_FWD_PERIOD
+   ticks, but only update weights every NCA_UPDATE_PERIOD ticks.
+   NCA_UPDATE_PERIOD / NCA_FWD_PERIOD = number of backward passes accumulated
+   per weight update (effective mini-batch over time). */
+#define NCA_FWD_PERIOD    4     /* run NCA forward + backward every N ticks */
+#define NCA_UPDATE_PERIOD 16    /* apply Adam step every N ticks (= 4 accumulations) */
 
 #define CHECK_CUDA(x) do { \
     cudaError_t _e = (x); \
@@ -1065,10 +1077,21 @@ __device__ float pixel_coherence(const void* px_base, size_t px_pitch,
     return coh_sum * inv; /* mean coherence [0,1] */
 }
 
-/* NCA trains on pixel coalescing — where hue coherence is increasing and
-   clusters are forming — not on wave disruption events.
-   Input: 3x3 neighborhood coherence + neighborhood mean RGB + history.
-   Target: predict next-tick coherence at this cell (one-tick lag). */
+/* NCA IO builder — HSV-based features with direct 3×3 neighborhood reads.
+   Old approach: called pixel_coherence() for each of 9 cells, each reading 8
+   neighbors, totalling ~180 global reads and ~81 trig-heavy HSV conversions.
+   New approach: reads 9 cells directly (18 total — curr and prev tick), computes
+   HSV of each cell once.  Coherence is computed cheaply from the already-extracted
+   hue angles.
+
+   Input layout (NCA_IN = 136):
+     [72]  9 cells × 8 features each:
+           Center cell (flat index 4):  (sin_h, cos_h, sat, val, coh, coh_delta, sin_h0, cos_h0)
+           Other 8 cells:               (sin_h, cos_h, sat, val, sin_h0, cos_h0, sat0, val0)
+     [64]  History ring: HIST_TICKS × 8 floats per tick (unchanged)
+
+   Target layout (NCA_OUT = 8):  one-tick-lag HSV state of this pixel:
+           (sin_h, cos_h, sat, val, coh, coh_delta, sin_h0, cos_h0) */
 __global__ void nca_build_io_kernel(const void* px_base,  size_t px_pitch,
                                     const void* px0_base, size_t px0_pitch,
                                     const float* ring, int ring_head,
@@ -1078,52 +1101,108 @@ __global__ void nca_build_io_kernel(const void* px_base,  size_t px_pitch,
     if (x >= WIDTH || y >= HEIGHT) return;
 
     int idx = y * WIDTH + x;
-    float* in = input + (size_t)idx * NCA_IN;
-    float* tgt = target + (size_t)idx * NCA_OUT;
+    float* in  = input       + (size_t)idx * NCA_IN;
+    float* tgt = target      + (size_t)idx * NCA_OUT;
     float* prev_tgt = prev_target + (size_t)idx * NCA_OUT;
 
-    /* Build input: for each cell in 3x3, coherence scalar + mean RGB (4 values) */
-    int t = 0;
+    /* Read 3×3 neighborhood for current and previous tick.
+       Compute HSV once per cell — avoids the ~10× redundant reads of the old
+       pixel_coherence-based approach. */
+    float sh[9], ch[9], sa[9], va[9];     /* current tick sin/cos hue, sat, val */
+    float sh0[9], ch0[9], sa0[9], va0[9]; /* previous tick */
+
     for (int oy = -1; oy <= 1; ++oy) {
+        int yy = clampi(y + oy, 0, HEIGHT - 1);
         for (int ox = -1; ox <= 1; ++ox) {
             int xx = clampi(x + ox, 0, WIDTH  - 1);
-            int yy = clampi(y + oy, 0, HEIGHT - 1);
-            float3 avg; float3 avg0;
-            float coh  = pixel_coherence(px_base,  px_pitch,  xx, yy, &avg);
-            float coh0 = pixel_coherence(px0_base, px0_pitch, xx, yy, &avg0);
-            in[t++] = coh;              /* current coherence */
-            in[t++] = coh - coh0;      /* coherence delta (growing or shrinking) */
-            in[t++] = avg.x;           /* mean R of neighborhood */
-            in[t++] = avg.y;           /* mean G */
-            in[t++] = avg.z;           /* mean B */
-            in[t++] = avg0.x;          /* previous mean R */
-            in[t++] = avg0.y;
-            in[t++] = avg0.z;
+            int flat = (oy + 1) * 3 + (ox + 1);
+
+            float4 pc  = row_f4_const(px_base,  px_pitch,  yy)[xx];
+            float4 pc0 = row_f4_const(px0_base, px0_pitch, yy)[xx];
+
+            float hh, ss, vv;
+            rgb_to_hsv_full(clamp01(pc.x), clamp01(pc.y), clamp01(pc.z), &hh, &ss, &vv);
+            sh[flat] = sinf(hh); ch[flat] = cosf(hh);
+            sa[flat] = ss; va[flat] = vv;
+
+            float hh0, ss0, vv0;
+            rgb_to_hsv_full(clamp01(pc0.x), clamp01(pc0.y), clamp01(pc0.z), &hh0, &ss0, &vv0);
+            sh0[flat] = sinf(hh0); ch0[flat] = cosf(hh0);
+            sa0[flat] = ss0; va0[flat] = vv0;
         }
     }
 
-    /* History ring */
+    /* Cheap coherence from pre-computed hue — no extra global reads.
+       cos²(Δh/2): 1=same hue, 0=opposite.  Average over 8 neighbors. */
+    const int ci = 4; /* center cell index in flat 3×3 array */
+    float center_h  = atan2f(sh[ci],  ch[ci]);
+    float center_h0 = atan2f(sh0[ci], ch0[ci]);
+    float coh_sum = 0.f, coh_sum0 = 0.f;
+    const float PI = 3.14159265f;
+    for (int i = 0; i < 9; ++i) {
+        if (i == ci) continue;
+        float dh = atan2f(sh[i], ch[i]) - center_h;
+        if (dh >  PI) dh -= 2.0f * PI;
+        if (dh < -PI) dh += 2.0f * PI;
+        float sim = cosf(dh * 0.5f); coh_sum += sim * sim;
+
+        float dh0 = atan2f(sh0[i], ch0[i]) - center_h0;
+        if (dh0 >  PI) dh0 -= 2.0f * PI;
+        if (dh0 < -PI) dh0 += 2.0f * PI;
+        float sim0 = cosf(dh0 * 0.5f); coh_sum0 += sim0 * sim0;
+    }
+    float coh  = coh_sum  * (1.0f / 8.0f);
+    float coh0 = coh_sum0 * (1.0f / 8.0f);
+
+    /* Build input: 8 features per cell in raster order (left-right, top-bottom).
+       Center cell gets coherence features instead of duplicate sat0/val0 to give
+       the NCA explicit access to the clustering signal at its location. */
+    int t = 0;
+    for (int flat = 0; flat < 9; ++flat) {
+        if (flat == ci) {
+            in[t++] = sh[flat];
+            in[t++] = ch[flat];
+            in[t++] = sa[flat];
+            in[t++] = va[flat];
+            in[t++] = coh;
+            in[t++] = coh - coh0;
+            in[t++] = sh0[flat];
+            in[t++] = ch0[flat];
+        } else {
+            in[t++] = sh[flat];
+            in[t++] = ch[flat];
+            in[t++] = sa[flat];
+            in[t++] = va[flat];
+            in[t++] = sh0[flat];
+            in[t++] = ch0[flat];
+            in[t++] = sa0[flat];
+            in[t++] = va0[flat];
+        }
+    }
+    /* t == 72 here */
+
+    /* History ring — unchanged, 8 floats per tick × HIST_TICKS ticks */
     for (int h = 0; h < HIST_TICKS; ++h) {
         int slot = (ring_head - h + HIST_TICKS) % HIST_TICKS;
         const float* src = ring + (((size_t)slot * CELLS + (size_t)idx) * 8);
         for (int c = 0; c < 8; ++c) in[t++] = src[c];
     }
+    /* t == 136 == NCA_IN */
 
-    /* Target: predict coherence at this cell next tick (one-tick lag) */
-    for (int c = 0; c < 8; ++c) tgt[c] = prev_tgt[c];
+    /* One-tick-lag target: copy prev_target → target, store current state into
+       prev_target so next invocation has this tick's physics state as its target.
+       Target is the HSV state of THIS pixel (not neighborhood mean) so the NCA
+       learns to predict per-pixel chromatic dynamics. */
+    for (int c = 0; c < NCA_OUT; ++c) tgt[c] = prev_tgt[c];
 
-    float3 avg_self;
-    float coh_self  = pixel_coherence(px_base,  px_pitch,  x, y, &avg_self);
-    float3 avg_self0;
-    float coh_self0 = pixel_coherence(px0_base, px0_pitch, x, y, &avg_self0);
-    prev_tgt[0] = coh_self;
-    prev_tgt[1] = coh_self - coh_self0;
-    prev_tgt[2] = avg_self.x;
-    prev_tgt[3] = avg_self.y;
-    prev_tgt[4] = avg_self.z;
-    prev_tgt[5] = avg_self0.x;
-    prev_tgt[6] = avg_self0.y;
-    prev_tgt[7] = avg_self0.z;
+    prev_tgt[0] = sh[ci];       /* sin(hue)        — periodic, no wrapping issues */
+    prev_tgt[1] = ch[ci];       /* cos(hue)        — quadrature pair */
+    prev_tgt[2] = sa[ci];       /* saturation      — vividity */
+    prev_tgt[3] = va[ci];       /* value           — brightness */
+    prev_tgt[4] = coh;          /* coherence       — clustering signal */
+    prev_tgt[5] = coh - coh0;   /* coherence delta — direction of change */
+    prev_tgt[6] = sh0[ci];      /* sin(prev_hue)   — hue trend */
+    prev_tgt[7] = ch0[ci];      /* cos(prev_hue) */
 }
 
 /* Hue-frequency ripple tank driver.
@@ -1539,13 +1618,23 @@ __global__ void grad_norm_kernel(const float* g, int n, float inv_n, float* d_gn
     atomicAdd(d_gnorm, v * v);
 }
 
-/* SGD with gradient clipping: if global norm > clip, scale all grads down */
-__global__ void sgd_step_kernel(float* w, float* g, int n, float lr, float inv_n,
-                                 float clip_scale) {
+/* Adam optimizer with gradient clipping.
+   m[i] and v[i] are the first and second moment estimates; they persist across
+   steps.  bc1 = 1/(1-beta1^t) and bc2 = 1/(1-beta2^t) are bias-correction
+   factors computed on the host.  Clears g[i] after applying the update so the
+   gradient accumulation buffer is ready for the next window. */
+__global__ void adam_step_kernel(float* w, float* g, float* m, float* v, int n,
+                                  float lr, float inv_n, float clip_scale,
+                                  float beta1, float beta2, float eps,
+                                  float bc1, float bc2) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float grad = g[i] * inv_n * clip_scale;
-    w[i] -= lr * grad;
+    m[i] = beta1 * m[i] + (1.0f - beta1) * grad;
+    v[i] = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    float m_hat = m[i] * bc1;
+    float v_hat = v[i] * bc2;
+    w[i] -= lr * m_hat / (sqrtf(v_hat) + eps);
     g[i] = 0.0f;
 }
 
@@ -2127,7 +2216,7 @@ static void process_live_controls(LiveTunables* t, int* params_dirty, int* reque
         if (t->gravity < 0.0f) t->gravity = 0.0f;
         if (t->gravity > 0.02f) t->gravity = 0.02f;
         if (t->lr < 0.000001f) t->lr = 0.000001f;
-        if (t->lr > 0.005f) t->lr = 0.005f;
+        if (t->lr > 0.01f) t->lr = 0.01f;
         if (t->triad < 0.0f) t->triad = 0.0f;
         if (t->triad > 0.5f) t->triad = 0.5f;
     }
@@ -2540,7 +2629,8 @@ int main(int argc, char** argv) {
     FILE* f_act = fopen("activations.csv", "a");
     FILE* f_energy = fopen("energy.csv", "a");
     FILE* f_de = fopen("delta_energy.csv", "a");
-    if (!f_act || !f_energy || !f_de) {
+    FILE* f_nca = fopen("nca_training.csv", "a");
+    if (!f_act || !f_energy || !f_de || !f_nca) {
         fprintf(stderr, "failed opening csv outputs\n");
         return 1;
     }
@@ -2548,24 +2638,48 @@ int main(int argc, char** argv) {
     if (ftell(f_act) == 0) fprintf(f_act, "tick,active\n");
     if (ftell(f_energy) == 0) fprintf(f_energy, "tick,wave_energy\n");
     if (ftell(f_de) == 0) fprintf(f_de, "tick,delta_energy\n");
+    if (ftell(f_nca) == 0) fprintf(f_nca, "tick,adam_step,nca_loss,nca_residual,grad_norm\n");
 
     float* nca_w = (float*)malloc(NCA_PARAMS * sizeof(float));
     float* nca_g = (float*)malloc(NCA_PARAMS * sizeof(float));
     if (!nca_w || !nca_g) return 1;
     memset(nca_g, 0, NCA_PARAMS * sizeof(float));
 
+    /* He (Kaiming) initialization for ReLU layers.
+       W1: fan_in = NCA_IN  → uniform scale = sqrt(6/NCA_IN)
+       W2: fan_in = NCA_H   → uniform scale = sqrt(6/NCA_H)
+       b1: small positive constant (0.01) to break dead-ReLU symmetry
+       b2: zero */
+    float w1_scale = sqrtf(6.0f / (float)NCA_IN);
+    float w2_scale = sqrtf(6.0f / (float)NCA_H);
     uint32_t rs = 0xCAFED00Du;
     for (int i = 0; i < NCA_PARAMS; ++i) {
         rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5;
-        nca_w[i] = (((float)(rs & 0xFFFFu) / 65535.0f) - 0.5f) * 0.02f;
+        float rnd = ((float)(rs & 0xFFFFu) / 65535.0f) - 0.5f;  /* [-0.5, 0.5) */
+        if (i < NCA_W1) {
+            nca_w[i] = rnd * 2.0f * w1_scale;
+        } else if (i < NCA_W1 + NCA_B1) {
+            nca_w[i] = 0.01f;   /* small positive bias — keeps ReLUs alive at init */
+        } else if (i < NCA_W1 + NCA_B1 + NCA_W2) {
+            nca_w[i] = rnd * 2.0f * w2_scale;
+        } else {
+            nca_w[i] = 0.0f;    /* output biases zero */
+        }
     }
 
     float* d_w = NULL;
     float* d_g = NULL;
+    float* d_m = NULL;   /* Adam first moment  (momentum) */
+    float* d_v = NULL;   /* Adam second moment (RMS estimate) */
+    int    adam_t = 0;   /* Adam step counter for bias correction */
     CHECK_CUDA(cudaMalloc(&d_w, NCA_PARAMS * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_g, NCA_PARAMS * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_m, NCA_PARAMS * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_v, NCA_PARAMS * sizeof(float)));
     CHECK_CUDA(cudaMemcpy(d_w, nca_w, NCA_PARAMS * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemset(d_g, 0, NCA_PARAMS * sizeof(float)));
+    CHECK_CUDA(cudaMemset(d_m, 0, NCA_PARAMS * sizeof(float)));
+    CHECK_CUDA(cudaMemset(d_v, 0, NCA_PARAMS * sizeof(float)));
 
     unsigned long long* d_active = NULL;
     float* d_wave_energy = NULL;
@@ -2806,10 +2920,15 @@ int main(int argc, char** argv) {
                 WIDTH, HEIGHT, tune.gravity, 2, 2.0f);
         }
 
-        CHECK_CUDA(cudaMemsetAsync(d_g, 0, NCA_PARAMS * sizeof(float), stream0));
+        /* Zero gradient buffer at the start of each accumulation window
+           (every NCA_UPDATE_PERIOD ticks) so we accumulate cleanly across
+           NCA_UPDATE_PERIOD / NCA_FWD_PERIOD backward passes before updating. */
+        if ((tick % NCA_UPDATE_PERIOD) == NCA_FWD_PERIOD) {
+            CHECK_CUDA(cudaMemsetAsync(d_g, 0, NCA_PARAMS * sizeof(float), stream0));
+        }
 
-        /* Comb + NCA per open substrate — NCA runs every 4 ticks to save compute */
-        if ((tick % 4) == 0) for (int sid = 0; sid < MAX_SUBSTRATES; ++sid) {
+        /* Comb + NCA forward/backward every NCA_FWD_PERIOD ticks */
+        if ((tick % NCA_FWD_PERIOD) == 0) for (int sid = 0; sid < MAX_SUBSTRATES; ++sid) {
             if (!pool.s[sid].active) continue;
             Plane* p = &pool.s[sid].p;
 
@@ -2858,22 +2977,34 @@ int main(int argc, char** argv) {
             p->ring_head = (p->ring_head + 1) % HIST_TICKS;
         }
 
-        if ((tick % 4) == 0) {
+        /* Adam weight update: fires every NCA_UPDATE_PERIOD ticks.
+           By this point NCA_UPDATE_PERIOD/NCA_FWD_PERIOD backward passes have
+           been accumulated into d_g, giving a larger effective batch. */
+        if ((tick % NCA_UPDATE_PERIOD) == 0) {
             int pb = 256;
             int pg = (NCA_PARAMS + pb - 1) / pb;
 
-            /* Gradient clipping: compute global norm, scale down if > 1.0 */
+            /* Global gradient norm for clipping */
             #define GRAD_CLIP 1.0f
             CHECK_CUDA(cudaMemsetAsync(d_gnorm, 0, sizeof(float), stream0));
-            grad_norm_kernel<<<pg, pb, 0, stream0>>>(d_g, NCA_PARAMS, 1.0f / (float)CELLS, d_gnorm);
+            /* Normalise by total accumulated samples:
+               NCA_UPDATE_PERIOD/NCA_FWD_PERIOD passes × CELLS samples each */
+            float n_acc = (float)(NCA_UPDATE_PERIOD / NCA_FWD_PERIOD) * (float)CELLS;
+            grad_norm_kernel<<<pg, pb, 0, stream0>>>(d_g, NCA_PARAMS, 1.0f / n_acc, d_gnorm);
             CHECK_CUDA(cudaStreamSynchronize(stream0));
             float h_gnorm = 0.0f;
             CHECK_CUDA(cudaMemcpy(&h_gnorm, d_gnorm, sizeof(float), cudaMemcpyDeviceToHost));
             float gnorm = sqrtf(h_gnorm);
             float clip_scale = (gnorm > GRAD_CLIP) ? (GRAD_CLIP / gnorm) : 1.0f;
 
-            sgd_step_kernel<<<pg, pb, 0, stream0>>>(d_w, d_g, NCA_PARAMS, tune.lr,
-                                                     1.0f / (float)CELLS, clip_scale);
+            /* Adam step with bias correction */
+            adam_t++;
+            float bc1 = 1.0f / (1.0f - powf(ADAM_BETA1, (float)adam_t));
+            float bc2 = 1.0f / (1.0f - powf(ADAM_BETA2, (float)adam_t));
+            adam_step_kernel<<<pg, pb, 0, stream0>>>(d_w, d_g, d_m, d_v, NCA_PARAMS,
+                                                      tune.lr, 1.0f / n_acc, clip_scale,
+                                                      ADAM_BETA1, ADAM_BETA2, ADAM_EPS,
+                                                      bc1, bc2);
             dash.grad_norm = gnorm;
         }
 
@@ -3057,6 +3188,12 @@ int main(int argc, char** argv) {
         fprintf(f_act, "%d,%llu\n", tick, (unsigned long long)h_active);
         fprintf(f_energy, "%d,%.9g\n", tick, h_we);
         fprintf(f_de, "%d,%.9g\n", tick, h_de);
+        /* Write NCA training record on Adam update ticks so the CSV reflects
+           actual optimizer steps rather than every simulation tick. */
+        if ((tick % NCA_UPDATE_PERIOD) == 0) {
+            fprintf(f_nca, "%d,%d,%.9g,%.9g,%.6g\n",
+                    tick, adam_t, h_nca_loss, h_nca_res, dash.grad_norm);
+        }
 
         /* Update dashboard state */
         dash.tick          = tick;
@@ -3115,7 +3252,7 @@ int main(int argc, char** argv) {
             int period = (opt.snap_every > 0) ? opt.snap_every : SNAPSHOT_PERIOD;
             if ((tick % period) == 0) {
                 snapshot_png(&pool.s[1], (uint64_t)tick, opt.snap_dir);
-                fflush(f_act); fflush(f_energy); fflush(f_de);
+                fflush(f_act); fflush(f_energy); fflush(f_de); fflush(f_nca);
             }
         }
 
@@ -3138,7 +3275,7 @@ int main(int argc, char** argv) {
 
     save_snapshot("snapshot_final.bin", &pool, (uint64_t)opt.ticks);
 
-    fclose(f_act); fclose(f_energy); fclose(f_de);
+    fclose(f_act); fclose(f_energy); fclose(f_de); fclose(f_nca);
 
     free(h_edges);
     free(natural_log);
@@ -3153,6 +3290,8 @@ int main(int argc, char** argv) {
     cudaFree(d_pair_corr);
     cudaFree(d_w);
     cudaFree(d_g);
+    cudaFree(d_m);
+    cudaFree(d_v);
     cudaFree(d_active);
     cudaFree(d_wave_energy);
     cudaFree(d_delta_energy);
