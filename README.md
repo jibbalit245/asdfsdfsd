@@ -33,6 +33,32 @@ RESUME=1 ./start.sh
 SEED=sparse OUT_DIR=./my_frames DEVICE=1 ./start.sh
 ```
 
+
+## RunPod / RTX 50xx troubleshooting
+
+If you are running on RunPod with RTX 5090 / 50xx GPUs and build fails with an
+architecture error (for example `unsupported gpu architecture`), use the updated
+`deploy/setup.sh` behavior:
+
+- It auto-detects compute capability when possible.
+- If your `nvcc` is too old for that exact `sm_XX`, it falls back to the newest
+  supported target and also emits PTX for forward-compat JIT.
+
+You can also force a specific architecture:
+
+```bash
+CUDA_ARCH=sm_90 ./deploy/setup.sh
+```
+
+Then run:
+
+```bash
+./start.sh
+```
+
+If `nvcc` is missing entirely on the pod image, install a CUDA toolkit image or
+switch to a RunPod template that includes CUDA compiler tools (not just drivers).
+
 ## Other scripts
 
 | Script | Purpose |
