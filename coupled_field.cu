@@ -2284,13 +2284,6 @@ static int parse_args(int argc, char** argv, HostOptions* opt) {
     return 0;
 }
 
-static void write_nca_weights(const char* path, const float* h_w, int n) {
-    FILE* f = fopen(path, "wb");
-    if (!f) return;
-    fwrite(h_w, sizeof(float), (size_t)n, f);
-    fclose(f);
-}
-
 /* NCA training checkpoint: weights + Adam first/second moments + step counter.
    Format: 4-byte magic 0x4E434143 ("NCAC") | int32 n | int32 adam_t |
            n floats w | n floats m | n floats v                              */
@@ -2850,6 +2843,7 @@ int main(int argc, char** argv) {
     int no_new_ent_ticks = 0;
     int ticks_executed = 0;
     int request_quit = 0;
+    float best_nca_loss = 1e30f; /* track best loss to gate model saves */
 
     for (int tick = 1; tick <= opt.ticks; ++tick) {
         int params_dirty = 0;
@@ -3225,7 +3219,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        /* Periodic comb candidate dump */
+        /* Periodic comb candidate collection — save NCA model only when improved */
         if ((tick % COMB_PERIOD) == 0) {
             CHECK_CUDA(cudaMemset(d_candidate_count, 0, sizeof(uint32_t)));
             candidate_pairs_kernel<<<grid, block>>>(
@@ -3236,43 +3230,18 @@ int main(int argc, char** argv) {
                 MAX_CANDIDATES);
             CHECK_CUDA(cudaGetLastError());
 
-            uint32_t h_count = 0;
-            CHECK_CUDA(cudaMemcpy(&h_count, d_candidate_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-            if (h_count > MAX_CANDIDATES) h_count = MAX_CANDIDATES;
-            PairCandidate* h_pairs = (PairCandidate*)malloc((size_t)h_count * sizeof(PairCandidate));
-            if (h_pairs) {
-                CHECK_CUDA(cudaMemcpy(h_pairs, d_candidates, (size_t)h_count * sizeof(PairCandidate), cudaMemcpyDeviceToHost));
-                char name[128];
-                snprintf(name, sizeof(name), "relations_%d.bin", tick);
-                FILE* rf = fopen(name, "wb");
-                if (rf) {
-                    fwrite(&h_count, sizeof(uint32_t), 1, rf);
-                    fwrite(h_pairs, sizeof(PairCandidate), h_count, rf);
-                    fclose(rf);
-                }
-                free(h_pairs);
+            /* Save NCA model only when it improves — all instances share best_nca.bin */
+            if (dash.nca_loss > 0.0 && dash.nca_loss < best_nca_loss) {
+                best_nca_loss = (float)dash.nca_loss;
+                CHECK_CUDA(cudaMemcpy(nca_w, d_w, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+                CHECK_CUDA(cudaMemcpy(nca_m, d_m, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+                CHECK_CUDA(cudaMemcpy(nca_v, d_v, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+                /* Atomic write via temp file + rename so concurrent instances don't corrupt */
+                write_nca_checkpoint("best_nca.bin.tmp", nca_w, nca_m, nca_v, adam_t, NCA_PARAMS);
+                rename("best_nca.bin.tmp", "best_nca.bin");
+                fprintf(stderr, "[model] tick=%d  loss=%.6g (improved) → best_nca.bin\n",
+                        tick, best_nca_loss);
             }
-
-            CHECK_CUDA(cudaMemcpy(nca_w, d_w, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
-            char nname[128];
-            snprintf(nname, sizeof(nname), "nca_weights_%d.bin", tick);
-            write_nca_weights(nname, nca_w, NCA_PARAMS);
-
-            /* Full NCA checkpoint (weights + Adam moments + step counter) so
-               a resume with --resume checkpoint_NNN.bin + auto-discovered
-               companion _nca.bin restores training state exactly. */
-            CHECK_CUDA(cudaMemcpy(nca_m, d_m, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
-            CHECK_CUDA(cudaMemcpy(nca_v, d_v, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
-            char cname[128];
-            snprintf(cname, sizeof(cname), "checkpoint_%d_nca.bin", tick);
-            write_nca_checkpoint(cname, nca_w, nca_m, nca_v, adam_t, NCA_PARAMS);
-
-            /* Substrate state checkpoint — allows resuming physics too */
-            char sname[128];
-            snprintf(sname, sizeof(sname), "checkpoint_%d.bin", tick);
-            save_snapshot(sname, &pool, (uint64_t)tick);
-            fprintf(stderr, "[checkpoint] tick=%d  substrate → %s  nca → %s\n",
-                    tick, sname, cname);
         }
 
         /* Stats + observability */
@@ -3399,13 +3368,20 @@ int main(int argc, char** argv) {
 
     save_snapshot("snapshot_final.bin", &pool, (uint64_t)opt.ticks);
 
-    /* Final NCA checkpoint — same naming convention as periodic ones so
-       --resume snapshot_final.bin auto-discovers snapshot_final_nca.bin */
+    /* Final NCA save — only overwrite best_nca.bin if end-of-run loss improved */
     CHECK_CUDA(cudaMemcpy(nca_w, d_w, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(nca_m, d_m, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(nca_v, d_v, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
-    write_nca_checkpoint("snapshot_final_nca.bin", nca_w, nca_m, nca_v, adam_t, NCA_PARAMS);
-    fprintf(stderr, "[final] substrate → snapshot_final.bin  nca → snapshot_final_nca.bin\n");
+    if (dash.nca_loss > 0.0 && dash.nca_loss < best_nca_loss) {
+        best_nca_loss = (float)dash.nca_loss;
+        write_nca_checkpoint("best_nca.bin.tmp", nca_w, nca_m, nca_v, adam_t, NCA_PARAMS);
+        rename("best_nca.bin.tmp", "best_nca.bin");
+        fprintf(stderr, "[final] substrate → snapshot_final.bin  nca → best_nca.bin (loss=%.6g)\n",
+                best_nca_loss);
+    } else {
+        fprintf(stderr, "[final] substrate → snapshot_final.bin  nca unchanged (best_nca.bin loss=%.6g)\n",
+                best_nca_loss);
+    }
 
     fclose(f_act); fclose(f_energy); fclose(f_de); fclose(f_nca);
 
