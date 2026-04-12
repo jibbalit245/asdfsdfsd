@@ -1,14 +1,11 @@
 #!/bin/bash
 # start.sh — clone the repo, run this once, everything else is automatic
 #
-# Builds coupled_field if needed, then launches a 500k-tick long run with defaults:
-#   seed      : random
-#   output    : ./frames_longrun
-#   device    : GPU 0
+# Builds coupled_field if needed, then launches a 500k-tick long run across
+# all available GPUs (up to 8), one instance per GPU with different seeds.
 #
-# Optional env overrides (all have safe defaults):
-#   SEED=random|impulse|sparse   OUT_DIR=./frames_longrun   DEVICE=0
-#   RESUME=1                     (pick up from latest checkpoint)
+# Optional env overrides:
+#   SNAP_EVERY=500   (PNG snapshot interval, default 500 ticks)
 
 set -e
 
@@ -21,9 +18,7 @@ if [ ! -x "./coupled_field" ]; then
     echo ""
 fi
 
-# ── launch with defaults ──────────────────────────────────────────────────────
-SEED=${SEED:-random}
-OUT_DIR=${OUT_DIR:-./frames_longrun}
-DEVICE=${DEVICE:-0}
+# ── launch across all GPUs ────────────────────────────────────────────────────
+SNAP_EVERY=${SNAP_EVERY:-500}
 
-exec bash deploy/run_longrun.sh "$SEED" "$OUT_DIR" "$DEVICE"
+exec bash deploy/run_multi.sh "$SNAP_EVERY"
