@@ -34,12 +34,6 @@ RESUME=1 ./start.sh
 SEED=sparse OUT_DIR=./my_frames DEVICE=1 ./start.sh
 ```
 
-Force single-GPU mode even on multi-GPU hosts:
-
-```bash
-MULTI_GPU=0 ./start.sh
-```
-
 
 ## RunPod / RTX 50xx troubleshooting
 
