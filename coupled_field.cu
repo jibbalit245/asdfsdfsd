@@ -299,13 +299,40 @@ static void init_freq_table(void) {
 #define DEFAULT_SUBSTRATES 2
 #define MAX_CANDIDATES 262144
 
+/* Collide-interference strength multiplier: kwtp × this factor determines
+   how strongly destructive wave zero-crossings flip pixels toward complement.
+   Higher = more entropy/chaos; lower = slower complementary disruption. */
+#define COLLIDE_STRENGTH_MULT 2.0f
+
 #define BASE_C2 0.18f
 #define BASE_DAMPING 0.9998f
-#define BASE_DRIVE 0.0008f
+#define BASE_DRIVE 0.002f       /* increased: stronger hue-frequency injection into wave */
 #define BASE_KWTP 0.020f
 #define BASE_FEEDBACK 0.00005f
-#define BASE_GRAVITY 0.003f
-#define BASE_LR 0.0001f
+#define BASE_GRAVITY 0.006f     /* increased: faster hue-cluster accumulation */
+#define BASE_LR 0.001f          /* Adam default — much higher than SGD needs */
+
+/* Adam hyperparameters — kept fixed (not tunable) */
+#define ADAM_BETA1 0.9f
+#define ADAM_BETA2 0.999f
+#define ADAM_EPS   1.0e-8f
+
+/* NCA gradient accumulation: run NCA forward/backward every NCA_FWD_PERIOD
+   ticks, but only update weights every NCA_UPDATE_PERIOD ticks.
+   NCA_UPDATE_PERIOD / NCA_FWD_PERIOD = number of backward passes accumulated
+   per weight update (effective mini-batch over time). */
+#define NCA_FWD_PERIOD    4     /* run NCA forward + backward every N ticks */
+#define NCA_UPDATE_PERIOD 16    /* apply Adam step every N ticks (= 4 accumulations) */
+/* NCA_ACCUMULATIONS = number of backward passes accumulated per Adam update */
+#define NCA_ACCUMULATIONS (NCA_UPDATE_PERIOD / NCA_FWD_PERIOD)
+
+/* Chromatic saturation thresholds — shared across kernels */
+#define MIN_SATURATION_ACHROMATIC 0.05f  /* below this S, pixel is considered achromatic */
+#define GRAVITY_MIN_SATURATION    0.75f  /* pixel_gravity_kernel saturation floor */
+#define COMPLEMENT_MIN_SATURATION 0.70f  /* complementary_neighbor_kernel sat floor */
+#define FLIP_MIN_SATURATION       0.75f  /* xor_broadcast_kernel saturation during flip */
+#define COLLIDE_MIN_SATURATION    0.80f  /* collide_interference_kernel saturation boost */
+#define MIN_COLLIDE_MAGNITUDE     0.02f  /* minimum wave zero-crossing strength to act */
 
 #define CHECK_CUDA(x) do { \
     cudaError_t _e = (x); \
@@ -324,6 +351,7 @@ typedef struct {
     int snap_every;      /* write pixel PNG every N ticks (0 = use SNAPSHOT_PERIOD) */
     char snap_dir[512];  /* directory for PNG output (empty = current dir) */
     char resume_path[512];
+    char nca_weights_path[512]; /* pre-trained NCA checkpoint to load on startup */
     char quantum_log[512];
 } HostOptions;
 
@@ -514,7 +542,7 @@ __global__ void xor_collect_kernel(
     float4 wlap = wv_lap_buf[y * width + x];
     float lap_mag = sqrtf(wlap.x*wlap.x + wlap.y*wlap.y + wlap.z*wlap.z + wlap.w*wlap.w);
     float strength = lap_mag * kwtp;
-    if (strength < 0.40f) return;   /* below threshold — not a real crossing */
+    if (strength < 0.08f) return;   /* lowered threshold — fires more often */
 
     float4 px = row_f4_const(px_base, px_pitch, y)[x];
 
@@ -529,9 +557,13 @@ __global__ void xor_collect_kernel(
     xor_buf[slot * 5 + 4] = fminf(1.0f, strength);
 }
 
-/* Pass 2 — broadcast complement transformation to all matching pixels.
-   For each pixel, compute similarity to each trigger color.
-   Apply complement push weighted by (similarity * crossing_strength). */
+/* Pass 2 — broadcast HSV complement transformation to all matching pixels.
+   For each pixel, check if its hue matches:
+     (A) the trigger hue → flip to complement (hue + π)
+     (B) the complement-neighbor zone (hue within 15°–65° of trigger complement)
+         → those pixels also flip to their complement (= toward subject zone)
+   This implements: subject+neighbors expel the complement; complement pair
+   expels the neighbors; both groups shift toward each other in XOR fashion. */
 __global__ void xor_broadcast_kernel(
     const void* px_cur_base, size_t px_cur_pitch,
     void*       px_nxt_base, size_t px_nxt_pitch,
@@ -549,44 +581,68 @@ __global__ void xor_broadcast_kernel(
 
     float4 me = row_f4_const(px_cur_base, px_cur_pitch, y)[x];
     float mr = clamp01(me.x), mg = clamp01(me.y), mb = clamp01(me.z);
+    float my_h, my_s, my_v;
+    rgb_to_hsv_full(mr, mg, mb, &my_h, &my_s, &my_v);
 
-    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-    float total_w = 0.0f;
+    const float PI = 3.14159265358979f;
+    float hue_flip_weight = 0.0f;
+
+    /* Guard against achromatic (gray) pixels — rgb_to_hue_rad returns 0 for
+       r=g=b.  We skip the flip for near-achromatic pixels since they have no
+       meaningful hue to preserve and adding a hue rotation to gray produces
+       oversaturated color spikes. */
+    if (my_s < MIN_SATURATION_ACHROMATIC) return;
 
     for (int s = 0; s < n; ++s) {
         float tr = xor_buf[s*5+0];
         float tg = xor_buf[s*5+1];
         float tb = xor_buf[s*5+2];
         float xstr = xor_buf[s*5+4];
+        float t_h = rgb_to_hue_rad(tr, tg, tb);
+        /* Skip achromatic trigger colors */
+        float t_v = fmaxf(tr, fmaxf(tg, tb));
+        float t_mn = fminf(tr, fminf(tg, tb));
+        if ((t_v < 1e-6f) || (t_v > 1e-6f && (t_v - t_mn) / t_v < MIN_SATURATION_ACHROMATIC)) continue;
 
-        /* Similarity: 1 = exact match, 0 = completely different color */
-        float dr = mr - tr, dg = mg - tg, dbb = mb - tb;
-        float dist = sqrtf(dr*dr + dg*dg + dbb*dbb) * 0.57735f; /* /sqrt(3) → [0,1] */
-        float sim  = fmaxf(0.0f, 1.0f - dist * 4.0f); /* sharp falloff */
-        sim = sim * sim;
+        /* --- Group A: pixels near the trigger hue (subject zone, within ~30°) --- */
+        float dh_a = my_h - t_h;
+        if (dh_a >  PI) dh_a -= 2.0f * PI;
+        if (dh_a < -PI) dh_a += 2.0f * PI;
+        float sim_a = fmaxf(0.0f, 1.0f - fabsf(dh_a) * (1.0f / 0.52f));
+        sim_a = sim_a * sim_a;
 
-        if (sim < 0.001f) continue;
+        /* --- Group B: complement-neighbor zone (15°–65° from trigger complement) --- */
+        float comp_h = t_h + PI;
+        float dh_from_comp = my_h - comp_h;
+        if (dh_from_comp >  PI) dh_from_comp -= 2.0f * PI;
+        if (dh_from_comp < -PI) dh_from_comp += 2.0f * PI;
+        float d_fc = fabsf(dh_from_comp);
+        const float NB_INNER = 0.26f; /* ~15° inner dead zone (exact complement handled by gravity) */
+        const float NB_OUTER = 1.13f; /* ~65° outer edge of complement-neighbor band */
+        float sim_b = 0.0f;
+        if (d_fc > NB_INNER && d_fc < NB_OUTER) {
+            float t = (d_fc - NB_INNER) / (NB_OUTER - NB_INNER);
+            sim_b = sinf(t * PI); /* smooth bump, 0 at edges, 1 at middle */
+        }
 
-        /* Complement = (1-r, 1-g, 1-b) — push toward it */
-        float weight = sim * xstr * broadcast_strength;
-        acc.x += (1.0f - mr - mr) * weight;   /* (1-r) - r = 1-2r */
-        acc.y += (1.0f - mg - mg) * weight;
-        acc.z += (1.0f - mb - mb) * weight;
-        total_w += weight;
+        float w = (sim_a + sim_b * 0.80f) * xstr * broadcast_strength;
+        if (w > 0.0f) hue_flip_weight += w;
     }
 
     /* Normalize so N simultaneous triggers don't stack unboundedly */
-    if (total_w > 1.0f) {
-        float inv = 1.0f / total_w;
-        acc.x *= inv;
-        acc.y *= inv;
-        acc.z *= inv;
-    }
+    float flip = fminf(1.0f, hue_flip_weight);
+    if (flip < 0.001f) return;
+
+    /* HSV complement flip: rotate hue by π × flip_amount, preserve saturation+value.
+       This keeps colors vivid throughout the flip — no desaturation from RGB blending. */
+    float flipped_h = my_h + flip * PI;
+    float new_s = fmaxf(my_s, FLIP_MIN_SATURATION); /* keep saturated through the flip */
+    float3 flipped_rgb = hsv_to_rgb_full(flipped_h, new_s, my_v);
 
     float4 out = row_f4(px_nxt_base, px_nxt_pitch, y)[x];
-    out.x = clamp01(out.x + acc.x);
-    out.y = clamp01(out.y + acc.y);
-    out.z = clamp01(out.z + acc.z);
+    out.x = clamp01(clamp01(out.x) + (flipped_rgb.x - mr) * flip);
+    out.y = clamp01(clamp01(out.y) + (flipped_rgb.y - mg) * flip);
+    out.z = clamp01(clamp01(out.z) + (flipped_rgb.z - mb) * flip);
     row_f4(px_nxt_base, px_nxt_pitch, y)[x] = out;
 }
 
@@ -886,49 +942,72 @@ void physics_tick_kernel(const void* px_cur_base, size_t px_cur_pitch,
     float4 px_inert = px;
 
     /* Wave crossing disruption: at every point where two wave arcs cross or
-       touch, inject the magnetically repelled opponent color — the hue 240°
-       away from whatever color is sitting there.  That's the color the local
-       cluster rejects most strongly, so it destroys the cluster structure and
-       forces rearrangement.  A single wave passing through barely moves the
-       Laplacian; two waves crossing spike it hard. */
+       touch, inject the magnetically repelled opponent color — the hue 180°
+       away (true complement) from whatever color is sitting there.  That's
+       the color the local cluster rejects most strongly via the complement
+       magnetism rule, so it destroys the cluster structure and forces
+       rearrangement.  Destructive interference drives entropy; constructive
+       interference spreads wave hue outward.  A single wave passing through
+       barely moves the Laplacian; two waves crossing spike it hard. */
     float lap_mag = sqrtf(fmaxf(0.0f,
         wv_lap.x * wv_lap.x + wv_lap.y * wv_lap.y +
         wv_lap.z * wv_lap.z + wv_lap.w * wv_lap.w));
     float cross_strength = clamp01(lap_mag * fmaxf(0.0f, kwtp));
 
+    /* Determine constructive vs destructive interference:
+       dot(wave, Laplacian) > 0 → Laplacian reinforces wave → constructive
+       dot(wave, Laplacian) < 0 → Laplacian opposes wave  → destructive
+       Normalize to get the cosine alignment in (-1, 1]. */
+    float wv_sq  = wv.x*wv.x  + wv.y*wv.y  + wv.z*wv.z  + wv.w*wv.w;
+    float lap_sq = wv_lap.x*wv_lap.x + wv_lap.y*wv_lap.y +
+                   wv_lap.z*wv_lap.z + wv_lap.w*wv_lap.w;
+    float cos_align = (wv_sq * lap_sq > 1.0e-16f)
+        ? (wv.x*wv_lap.x + wv.y*wv_lap.y + wv.z*wv_lap.z + wv.w*wv_lap.w)
+          / sqrtf(wv_sq * lap_sq)
+        : 0.0f;
+    /* constructive_frac ∈ [0,1]: 1=fully constructive, 0=fully destructive */
+    float constructive_frac = (cos_align + 1.0f) * 0.5f;
+
     /* Wave-encoded hue disruption.
        Waves are driven by pixel RGB, so their chromatic channels carry the hue
        of wherever they originated.  Decode that hue and push the local pixel
-       toward it — a wave crossing injects foreign hue information, breaking
-       up crystallized attractor states and spreading continuous spectrum.
-       We use the *current* wave value (not Laplacian) for hue direction, and
-       the Laplacian magnitude for disruption strength. */
+       toward it (constructive) or toward the complement (destructive).
+       We use the *current* wave value for hue direction and the Laplacian
+       magnitude for disruption strength. */
     float wr = wv.x, wg = wv.y, wb = wv.z;
     float wlum = (wr + wg + wb) * 0.33333f;
     float wcr = wr - wlum, wcg = wg - wlum, wcb = wb - wlum;
-    /* Decode wave hue using the same hex-sector logic as hue_to_rgb inverse.
-       We project chromatic content onto the hue wheel via atan2. */
+    /* Project chromatic content onto the hue wheel via atan2 */
     float wave_h_rad = atan2f(wcg - wcb, wcr - (wcg + wcb) * 0.5f);
-    /* wave_h_rad is in (-π, π]; convert to [0,1) hue */
     if (wave_h_rad < 0.0f) wave_h_rad += 6.28318530f;
     float wave_hue01 = wave_h_rad * (1.0f / 6.28318530f);
-    /* Only apply if the wave has meaningful chromatic content */
     float wave_chroma = sqrtf(wcr*wcr + wcg*wcg + wcb*wcb);
     float3 wave_color = hue_to_rgb(wave_hue01);
 
-    /* Also keep the triadic kick (+ 240°) as a secondary channel — it adds
-       variety when the incoming wave chroma is weak. Blend based on chroma. */
+    /* Destructive target: true complement (180°) — the color that disrupts
+       and creates entropy, keeping the system from locking into attractors. */
     float my_hue01 = rgb_to_hue_rad(clamp01(px.x), clamp01(px.y), clamp01(px.z))
                      * (1.0f / 6.28318530f);
-    float opp_hue01 = my_hue01 + 0.6667f;
-    if (opp_hue01 >= 1.0f) opp_hue01 -= 1.0f;
-    float3 opp = hue_to_rgb(opp_hue01);
+    float comp_hue01 = my_hue01 + 0.5f;   /* 180° = true complement */
+    if (comp_hue01 >= 1.0f) comp_hue01 -= 1.0f;
+    float3 comp = hue_to_rgb(comp_hue01);
 
-    float chroma_blend = clamp01(wave_chroma * 4.0f); /* 0=triadic, 1=wave-hue */
+    float chroma_blend = clamp01(wave_chroma * 4.0f); /* 0=complement, 1=wave-hue */
+
+    /* Blend constructive target (wave hue) and destructive target (complement)
+       based on alignment.  Constructive → spread wave hue (color diversity).
+       Destructive → push toward complement (entropy/chaos). */
+    float3 construct_target = make_float3(
+        wave_color.x * chroma_blend + comp.x * (1.0f - chroma_blend),
+        wave_color.y * chroma_blend + comp.y * (1.0f - chroma_blend),
+        wave_color.z * chroma_blend + comp.z * (1.0f - chroma_blend)
+    );
+    float3 destruct_target = comp;  /* pure complement push */
+
     float3 target = make_float3(
-        wave_color.x * chroma_blend + opp.x * (1.0f - chroma_blend),
-        wave_color.y * chroma_blend + opp.y * (1.0f - chroma_blend),
-        wave_color.z * chroma_blend + opp.z * (1.0f - chroma_blend)
+        construct_target.x * constructive_frac + destruct_target.x * (1.0f - constructive_frac),
+        construct_target.y * constructive_frac + destruct_target.y * (1.0f - constructive_frac),
+        construct_target.z * constructive_frac + destruct_target.z * (1.0f - constructive_frac)
     );
 
     float4 px_next = make_float4(
@@ -1009,10 +1088,21 @@ __device__ float pixel_coherence(const void* px_base, size_t px_pitch,
     return coh_sum * inv; /* mean coherence [0,1] */
 }
 
-/* NCA trains on pixel coalescing — where hue coherence is increasing and
-   clusters are forming — not on wave disruption events.
-   Input: 3x3 neighborhood coherence + neighborhood mean RGB + history.
-   Target: predict next-tick coherence at this cell (one-tick lag). */
+/* NCA IO builder — HSV-based features with direct 3×3 neighborhood reads.
+   Old approach: called pixel_coherence() for each of 9 cells, each reading 8
+   neighbors, totalling ~180 global reads and ~81 trig-heavy HSV conversions.
+   New approach: reads 9 cells directly (18 total — curr and prev tick), computes
+   HSV of each cell once.  Coherence is computed cheaply from the already-extracted
+   hue angles.
+
+   Input layout (NCA_IN = 136):
+     [72]  9 cells × 8 features each:
+           Center cell (flat index 4):  (sin_h, cos_h, sat, val, coh, coh_delta, sin_h0, cos_h0)
+           Other 8 cells:               (sin_h, cos_h, sat, val, sin_h0, cos_h0, sat0, val0)
+     [64]  History ring: HIST_TICKS × 8 floats per tick (unchanged)
+
+   Target layout (NCA_OUT = 8):  one-tick-lag HSV state of this pixel:
+           (sin_h, cos_h, sat, val, coh, coh_delta, sin_h0, cos_h0) */
 __global__ void nca_build_io_kernel(const void* px_base,  size_t px_pitch,
                                     const void* px0_base, size_t px0_pitch,
                                     const float* ring, int ring_head,
@@ -1022,54 +1112,128 @@ __global__ void nca_build_io_kernel(const void* px_base,  size_t px_pitch,
     if (x >= WIDTH || y >= HEIGHT) return;
 
     int idx = y * WIDTH + x;
-    float* in = input + (size_t)idx * NCA_IN;
-    float* tgt = target + (size_t)idx * NCA_OUT;
+    float* in  = input       + (size_t)idx * NCA_IN;
+    float* tgt = target      + (size_t)idx * NCA_OUT;
     float* prev_tgt = prev_target + (size_t)idx * NCA_OUT;
 
-    /* Build input: for each cell in 3x3, coherence scalar + mean RGB (4 values) */
-    int t = 0;
+    /* Read 3×3 neighborhood for current and previous tick.
+       Compute HSV once per cell — avoids the ~10× redundant reads of the old
+       pixel_coherence-based approach. */
+    float sh[9], ch[9], sa[9], va[9];     /* current tick sin/cos hue, sat, val */
+    float sh0[9], ch0[9], sa0[9], va0[9]; /* previous tick */
+
     for (int oy = -1; oy <= 1; ++oy) {
+        int yy = clampi(y + oy, 0, HEIGHT - 1);
         for (int ox = -1; ox <= 1; ++ox) {
             int xx = clampi(x + ox, 0, WIDTH  - 1);
-            int yy = clampi(y + oy, 0, HEIGHT - 1);
-            float3 avg; float3 avg0;
-            float coh  = pixel_coherence(px_base,  px_pitch,  xx, yy, &avg);
-            float coh0 = pixel_coherence(px0_base, px0_pitch, xx, yy, &avg0);
-            in[t++] = coh;              /* current coherence */
-            in[t++] = coh - coh0;      /* coherence delta (growing or shrinking) */
-            in[t++] = avg.x;           /* mean R of neighborhood */
-            in[t++] = avg.y;           /* mean G */
-            in[t++] = avg.z;           /* mean B */
-            in[t++] = avg0.x;          /* previous mean R */
-            in[t++] = avg0.y;
-            in[t++] = avg0.z;
+            int flat = (oy + 1) * 3 + (ox + 1);
+
+            float4 pc  = row_f4_const(px_base,  px_pitch,  yy)[xx];
+            float4 pc0 = row_f4_const(px0_base, px0_pitch, yy)[xx];
+
+            float hh, ss, vv;
+            rgb_to_hsv_full(clamp01(pc.x), clamp01(pc.y), clamp01(pc.z), &hh, &ss, &vv);
+            sh[flat] = sinf(hh); ch[flat] = cosf(hh);
+            sa[flat] = ss; va[flat] = vv;
+
+            float hh0, ss0, vv0;
+            rgb_to_hsv_full(clamp01(pc0.x), clamp01(pc0.y), clamp01(pc0.z), &hh0, &ss0, &vv0);
+            sh0[flat] = sinf(hh0); ch0[flat] = cosf(hh0);
+            sa0[flat] = ss0; va0[flat] = vv0;
         }
     }
 
-    /* History ring */
+    /* Cheap coherence from pre-computed hue — no extra global reads.
+       cos²(Δh/2): 1=same hue, 0=opposite.  Average over 8 neighbors. */
+    const int ci = 4; /* center cell index in flat 3×3 array */
+    float center_h  = atan2f(sh[ci],  ch[ci]);
+    float center_h0 = atan2f(sh0[ci], ch0[ci]);
+    float coh_sum = 0.f, coh_sum0 = 0.f;
+    const float PI = 3.14159265f;
+    for (int i = 0; i < 9; ++i) {
+        if (i == ci) continue;
+        float dh = atan2f(sh[i], ch[i]) - center_h;
+        if (dh >  PI) dh -= 2.0f * PI;
+        if (dh < -PI) dh += 2.0f * PI;
+        float sim = cosf(dh * 0.5f); coh_sum += sim * sim;
+
+        float dh0 = atan2f(sh0[i], ch0[i]) - center_h0;
+        if (dh0 >  PI) dh0 -= 2.0f * PI;
+        if (dh0 < -PI) dh0 += 2.0f * PI;
+        float sim0 = cosf(dh0 * 0.5f); coh_sum0 += sim0 * sim0;
+    }
+    float coh  = coh_sum  * (1.0f / 8.0f);
+    float coh0 = coh_sum0 * (1.0f / 8.0f);
+
+    /* Build input: 8 features per cell in raster order (left-right, top-bottom).
+       Center cell gets coherence features instead of duplicate sat0/val0 to give
+       the NCA explicit access to the clustering signal at its location. */
+    int t = 0;
+    for (int flat = 0; flat < 9; ++flat) {
+        if (flat == ci) {
+            in[t++] = sh[flat];
+            in[t++] = ch[flat];
+            in[t++] = sa[flat];
+            in[t++] = va[flat];
+            in[t++] = coh;
+            in[t++] = coh - coh0;
+            in[t++] = sh0[flat];
+            in[t++] = ch0[flat];
+        } else {
+            in[t++] = sh[flat];
+            in[t++] = ch[flat];
+            in[t++] = sa[flat];
+            in[t++] = va[flat];
+            in[t++] = sh0[flat];
+            in[t++] = ch0[flat];
+            in[t++] = sa0[flat];
+            in[t++] = va0[flat];
+        }
+    }
+    /* t == 72 here */
+
+    /* History ring — unchanged, 8 floats per tick × HIST_TICKS ticks */
     for (int h = 0; h < HIST_TICKS; ++h) {
         int slot = (ring_head - h + HIST_TICKS) % HIST_TICKS;
         const float* src = ring + (((size_t)slot * CELLS + (size_t)idx) * 8);
         for (int c = 0; c < 8; ++c) in[t++] = src[c];
     }
+    /* t == 136 == NCA_IN */
 
-    /* Target: predict coherence at this cell next tick (one-tick lag) */
-    for (int c = 0; c < 8; ++c) tgt[c] = prev_tgt[c];
+    /* One-tick-lag target: copy prev_target → target, store current state into
+       prev_target so next invocation has this tick's physics state as its target.
+       Target is the HSV state of THIS pixel (not neighborhood mean) so the NCA
+       learns to predict per-pixel chromatic dynamics. */
+    for (int c = 0; c < NCA_OUT; ++c) tgt[c] = prev_tgt[c];
 
-    float3 avg_self;
-    float coh_self  = pixel_coherence(px_base,  px_pitch,  x, y, &avg_self);
-    float3 avg_self0;
-    float coh_self0 = pixel_coherence(px0_base, px0_pitch, x, y, &avg_self0);
-    prev_tgt[0] = coh_self;
-    prev_tgt[1] = coh_self - coh_self0;
-    prev_tgt[2] = avg_self.x;
-    prev_tgt[3] = avg_self.y;
-    prev_tgt[4] = avg_self.z;
-    prev_tgt[5] = avg_self0.x;
-    prev_tgt[6] = avg_self0.y;
-    prev_tgt[7] = avg_self0.z;
+    prev_tgt[0] = sh[ci];       /* sin(hue)        — periodic, no wrapping issues */
+    prev_tgt[1] = ch[ci];       /* cos(hue)        — quadrature pair */
+    prev_tgt[2] = sa[ci];       /* saturation      — vividity */
+    prev_tgt[3] = va[ci];       /* value           — brightness */
+    prev_tgt[4] = coh;          /* coherence       — clustering signal */
+    prev_tgt[5] = coh - coh0;   /* coherence delta — direction of change */
+    prev_tgt[6] = sh0[ci];      /* sin(prev_hue)   — hue trend */
+    prev_tgt[7] = ch0[ci];      /* cos(prev_hue) */
 }
 
+/* Hue-frequency ripple tank driver.
+   Each pixel's neighborhood has a dominant hue = a frequency on the color
+   wheel.  Inject that frequency as a sin/cos pair into the wave so the
+   ripple tank carries actual hue-frequency information.  Where same-hue
+   pixels cluster (high coherence) they collectively reinforce a single
+   wave frequency, causing resonant standing-wave patterns that form the
+   fractal structures.  Pixels far from the neighborhood hue inject a
+   smaller, less-coherent signal, naturally suppressing chaos in mixed
+   regions and amplifying it in coherent clusters.
+
+   Wave channel encoding:
+     ch0 = sin(hue)        fundamental hue frequency (quadrature pair)
+     ch1 = cos(hue)
+     ch2 = sin(2·hue)      second harmonic — creates interference sub-bands
+     ch3 = cos(2·hue)
+
+   Hue similarity (cos²(Δh/2)) weights the injection so the wave from a
+   cluster carries the cluster's own frequency, not a smeared average. */
 __global__ void color_gravity_kernel(
     const void* px_base, size_t px_pitch,
     void* wv_base, size_t wv_pitch,
@@ -1079,61 +1243,54 @@ __global__ void color_gravity_kernel(
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
 
-    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    /* Accumulate neighborhood RGB to find the dominant hue */
+    float acc_r = 0.f, acc_g = 0.f, acc_b = 0.f;
     int count = 0;
     for (int oy = -radius; oy <= radius; ++oy) {
         int yy = clampi(y + oy, 0, height - 1);
         for (int ox = -radius; ox <= radius; ++ox) {
             int xx = clampi(x + ox, 0, width - 1);
             float4 p = row_f4_const(px_base, px_pitch, yy)[xx];
-            acc.x += p.x; acc.y += p.y; acc.z += p.z; acc.w += p.w;
+            acc_r += p.x; acc_g += p.y; acc_b += p.z;
             count++;
         }
     }
 
     float inv_count = 1.0f / fmaxf(1.0f, (float)count);
-    float4 avg = make_float4(acc.x * inv_count, acc.y * inv_count, acc.z * inv_count, acc.w * inv_count);
+    float ar = clamp01(acc_r * inv_count);
+    float ag = clamp01(acc_g * inv_count);
+    float ab = clamp01(acc_b * inv_count);
+
+    /* Compute neighborhood dominant hue */
+    float avg_h, avg_s, avg_v;
+    rgb_to_hsv_full(ar, ag, ab, &avg_h, &avg_s, &avg_v);
+
+    /* Compute my own hue */
     float4 me = row_f4_const(px_base, px_pitch, y)[x];
+    float my_h, my_s, my_v;
+    rgb_to_hsv_full(clamp01(me.x), clamp01(me.y), clamp01(me.z), &my_h, &my_s, &my_v);
 
-    /* Colors ARE frequencies — use RGB directly, no HSV needed.
-       Center each component around mean so complementary colors cancel.
-       The 5×5 average IS the local running mean: as the fractal fills in
-       with color, avg_rgb brightens and the pull toward the neighborhood
-       mean grows proportionally — amplitude accumulates with the canvas. */
-    float3 avg_rgb = make_float3(clamp01(avg.x), clamp01(avg.y), clamp01(avg.z));
-    float avg_alpha = clamp01(avg.w);
-    float avg_lum = (avg_rgb.x + avg_rgb.y + avg_rgb.z) * 0.33333f;
-    float4 freq_n = make_float4(
-        (avg_rgb.x - avg_lum) * avg_alpha,
-        (avg_rgb.y - avg_lum) * avg_alpha,
-        (avg_rgb.z - avg_lum) * avg_alpha,
-        (avg_lum - 0.5f)      * avg_alpha
-    );
+    /* Hue coherence: how closely does this pixel match the neighborhood hue?
+       cos²(Δh/2): 1 at same hue, 0 at opposite hue.
+       The injection is strongest where the pixel IS the neighborhood hue —
+       coherent clusters inject a clean frequency signal. */
+    float dh = avg_h - my_h;
+    if (dh >  3.14159265f) dh -= 6.28318530f;
+    if (dh < -3.14159265f) dh += 6.28318530f;
+    float hue_coh = cosf(dh * 0.5f);
+    hue_coh = hue_coh * hue_coh;
 
-    float3 my_rgb = make_float3(clamp01(me.x), clamp01(me.y), clamp01(me.z));
-    float my_alpha = clamp01(me.w);
-    float my_lum = (my_rgb.x + my_rgb.y + my_rgb.z) * 0.33333f;
-    float4 freq_s = make_float4(
-        (my_rgb.x - my_lum) * my_alpha,
-        (my_rgb.y - my_lum) * my_alpha,
-        (my_rgb.z - my_lum) * my_alpha,
-        (my_lum - 0.5f)     * my_alpha
-    );
+    float pull = hue_coh * fmaxf(0.0f, gravity_gain);
 
-    float dx = my_rgb.x - avg_rgb.x;
-    float dy = my_rgb.y - avg_rgb.y;
-    float dz = my_rgb.z - avg_rgb.z;
-    float dist = sqrtf(dx * dx + dy * dy + dz * dz) * (1.0f / 1.7320508f);
-    dist = clamp01(dist);
-
-    float pull = (1.0f - dist);
-    pull = pull * pull * fmaxf(0.0f, gravity_gain);
-
+    /* Inject hue frequency: sin/cos of the neighborhood's dominant hue.
+       Subtracting the pixel's own contribution prevents self-reinforcement
+       (a pixel in a uniform cluster gets zero net injection; only pixels on
+       cluster boundaries or in mixed regions see a signal). */
     float4 delta = make_float4(
-        (freq_n.x - freq_s.x) * pull,
-        (freq_n.y - freq_s.y) * pull,
-        (freq_n.z - freq_s.z) * pull,
-        (freq_n.w - freq_s.w) * pull
+        (sinf(avg_h) - sinf(my_h)) * pull,
+        (cosf(avg_h) - cosf(my_h)) * pull,
+        (sinf(avg_h * 2.0f) - sinf(my_h * 2.0f)) * pull * 0.5f,
+        (cosf(avg_h * 2.0f) - cosf(my_h * 2.0f)) * pull * 0.5f
     );
 
     float4 wv = row_f4(wv_base, wv_pitch, y)[x];
@@ -1156,8 +1313,10 @@ __global__ void color_gravity_kernel(
    The force direction in RGB space is toward or away from the neighbor's color.
    Written additively into pixel_next (which already has physics-tick result). */
 
-/* Pixel chromatic gravity — pulls pixels directly toward similar-hue neighbors.
-   Closer hue = stronger pull.  Runs on pixel_curr → adds to pixel_next.
+/* Pixel chromatic gravity — pulls pixels toward similar-hue neighbors by
+   rotating the pixel's hue in HSV space.  Closer hue = stronger pull.
+   Saturation and value are preserved (and saturation is gently restored if
+   it drops below 0.75) so gravity clusters by hue without desaturating.
    This is the gravitational clustering force that builds the fractal structures. */
 __global__ void pixel_gravity_kernel(
     const void* px_cur_base, size_t px_cur_pitch,
@@ -1170,47 +1329,121 @@ __global__ void pixel_gravity_kernel(
     if (x >= width || y >= height) return;
 
     float4 me = row_f4_const(px_cur_base, px_cur_pitch, y)[x];
-    float mr = clamp01(me.x), mg = clamp01(me.y), mb = clamp01(me.z);
-    float theta = rgb_to_hue_rad(mr, mg, mb);
+    float my_h, my_s, my_v;
+    rgb_to_hsv_full(clamp01(me.x), clamp01(me.y), clamp01(me.z), &my_h, &my_s, &my_v);
 
     /* 8-neighbor for smoother fluid blending; diagonals weighted 0.707 */
     const int NX[8] = {-1, 1,  0, 0, -1,  1, -1,  1};
     const int NY[8] = { 0, 0, -1, 1, -1, -1,  1,  1};
     const float NW[8] = {1.f,1.f,1.f,1.f, 0.707f,0.707f,0.707f,0.707f};
-    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-    float total_w = 0.f;
+
+    float hue_pull   = 0.0f;
+    float weight_sum = 0.0f;
+    float val_pull   = 0.0f;
 
     for (int i = 0; i < 8; ++i) {
         int nx = clampi(x + NX[i], 0, width  - 1);
         int ny = clampi(y + NY[i], 0, height - 1);
         float4 nb = row_f4_const(px_cur_base, px_cur_pitch, ny)[nx];
-        float nr = clamp01(nb.x), ng = clamp01(nb.y), nbb = clamp01(nb.z);
-        float phi = rgb_to_hue_rad(nr, ng, nbb);
+        float nb_h, nb_s, nb_v;
+        rgb_to_hsv_full(clamp01(nb.x), clamp01(nb.y), clamp01(nb.z), &nb_h, &nb_s, &nb_v);
 
-        float dh = phi - theta;
+        float dh = nb_h - my_h;
         if (dh >  3.14159265f) dh -= 6.28318530f;
         if (dh < -3.14159265f) dh += 6.28318530f;
 
         /* Gravity: closer hue = stronger pull. cos²(dh/2): 1 at same, 0 at opposite. */
         float sim = cosf(dh * 0.5f);
         sim = sim * sim * NW[i];
-        acc.x += (nb.x - me.x) * sim;
-        acc.y += (nb.y - me.y) * sim;
-        acc.z += (nb.z - me.z) * sim;
-        total_w += sim;
+
+        /* Accumulate hue rotation delta and weight */
+        hue_pull   += dh * sim;
+        weight_sum += sim;
+        val_pull   += (nb_v - my_v) * sim;
     }
 
-    if (total_w > 0.0f) {
-        float inv = strength / total_w;
+    if (weight_sum > 1.0e-6f) {
+        float inv = strength / weight_sum;
+        /* Rotate hue toward similar-hue neighbors */
+        float new_h = my_h + hue_pull * inv;
+        /* Keep saturation vivid — gravity must not desaturate */
+        float new_s = my_s;
+        if (new_s < GRAVITY_MIN_SATURATION) new_s = my_s + (GRAVITY_MIN_SATURATION - my_s) * 0.03f;
+        /* Gentle value averaging keeps brightness coherent in clusters */
+        float new_v = clamp01(my_v + val_pull * inv * 0.25f);
+
+        float3 rgb = hsv_to_rgb_full(new_h, new_s, new_v);
         float4 out = row_f4(px_nxt_base, px_nxt_pitch, y)[x];
-        out.x = clamp01(out.x + acc.x * inv);
-        out.y = clamp01(out.y + acc.y * inv);
-        out.z = clamp01(out.z + acc.z * inv);
+        out.x = clamp01(rgb.x);
+        out.y = clamp01(rgb.y);
+        out.z = clamp01(rgb.z);
         row_f4(px_nxt_base, px_nxt_pitch, y)[x] = out;
     }
 }
 
-/* Complementary neighbor force — Mexican hat on the hue wheel.
+/* Collide (destructive) interference kernel.
+   When the wave changes sign at a pixel — indicating a wave collision /
+   destructive cancellation — flip the local pixel and its complement to
+   create entropic disruption.  This prevents the system from reaching stable
+   attractors and keeps the field perpetually fluid.
+
+   Detects zero crossings in the wave (sign of wave_curr ≠ sign of wave_prev)
+   weighted by the amplitude of the crossing.  At each such event:
+     • The subject pixel is pushed toward its HSV complement (hue + π).
+     • Complement-zone pixels (globally) are handled by the XOR broadcast.
+   This kernel applies only the LOCAL subject flip; the global complement
+   response is picked up by the XOR broadcast on the same tick. */
+__global__ void collide_interference_kernel(
+    const void* wv_cur_base, size_t wv_cur_pitch,
+    const void* wv_prev_base, size_t wv_prev_pitch,
+    const void* px_cur_base, size_t px_cur_pitch,
+    void*       px_nxt_base, size_t px_nxt_pitch,
+    int width, int height,
+    float strength)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    float4 wv_cur  = row_f4_const(wv_cur_base,  wv_cur_pitch,  y)[x];
+    float4 wv_prev = row_f4_const(wv_prev_base, wv_prev_pitch, y)[x];
+
+    /* Detect sign change (zero crossing) in any wave channel.
+       sign_prod < 0 means prev and curr had opposite signs → zero crossing.
+       Magnitude contribution is sqrt(|prev * curr|) — proportional to the
+       amplitudes at the crossing, favouring high-energy collisions. */
+    float sign_prod_x = wv_prev.x * wv_cur.x;
+    float sign_prod_y = wv_prev.y * wv_cur.y;
+    float sign_prod_z = wv_prev.z * wv_cur.z;
+
+    /* Collide event: sum sqrts of crossing magnitudes across channels */
+    float collide_mag = sqrtf(
+        fmaxf(0.0f, -sign_prod_x) +
+        fmaxf(0.0f, -sign_prod_y) +
+        fmaxf(0.0f, -sign_prod_z)
+    ) * (1.0f / 1.7320508f); /* /sqrt(3) → normalized to [0,1] per channel */
+
+    if (collide_mag < MIN_COLLIDE_MAGNITUDE) return; /* too weak — ignore */
+
+    float4 me = row_f4_const(px_cur_base, px_cur_pitch, y)[x];
+    float my_h, my_s, my_v;
+    rgb_to_hsv_full(clamp01(me.x), clamp01(me.y), clamp01(me.z), &my_h, &my_s, &my_v);
+
+    /* Flip toward HSV complement (hue + π = 180°) — true complement, not RGB */
+    float comp_h = my_h + 3.14159265f;
+    float flip_s = fmaxf(my_s, COLLIDE_MIN_SATURATION); /* collide boosts saturation for vivid effect */
+    float3 comp_rgb = hsv_to_rgb_full(comp_h, flip_s, my_v);
+
+    float w = fminf(1.0f, collide_mag * strength);
+
+    float4 out = row_f4(px_nxt_base, px_nxt_pitch, y)[x];
+    out.x = clamp01(clamp01(out.x) + (comp_rgb.x - clamp01(me.x)) * w);
+    out.y = clamp01(clamp01(out.y) + (comp_rgb.y - clamp01(me.y)) * w);
+    out.z = clamp01(clamp01(out.z) + (comp_rgb.z - clamp01(me.z)) * w);
+    row_f4(px_nxt_base, px_nxt_pitch, y)[x] = out;
+}
+
+
    Rule:
      exact complement (dh = π)         → ATTRACT (f = +1)
      one shade off complement (dh≈π±σ) → REPEL   (f < 0)
@@ -1239,11 +1472,12 @@ __global__ void complementary_neighbor_kernel(
     const int NY[8] = { 0, 0, -1, 1, -1, -1,  1,  1};
     const float NW[8] = {1.f,1.f,1.f,1.f, 0.5f,0.5f,0.5f,0.5f};
 
-    /* σ = 0.12 rad ≈ 7° on the hue wheel — tight band around exact complement.
-       Repulsion zero-crosses at d = σ*sqrt(3) ≈ 0.21 rad ≈ 12°.
-       Hues more than ~12° from the complement angle are left untouched,
+    /* σ = 0.35 rad ≈ 20° on the hue wheel — wider band than before so the
+       "one shade off complement" repulsion zone is clearly visible.
+       Repulsion zero-crosses at d = σ*sqrt(3) ≈ 0.61 rad ≈ 35°.
+       Hues more than ~35° from the complement angle are left untouched,
        keeping most of the wheel free for continuous spectrum diversity. */
-    const float sigma = 0.12f;
+    const float sigma = 0.35f;
     const float sigma2 = sigma * sigma;
     const float PI = 3.14159265358979f;
 
@@ -1291,8 +1525,8 @@ __global__ void complementary_neighbor_kernel(
     /* Apply hue rotation and saturation shift in HSV, convert back to RGB */
     float new_h = my_h + hue_delta * strength;
     float new_s = clamp01(my_s + sat_delta * strength);
-    /* Clamp saturation upward so colors stay vivid — don't let them gray out */
-    if (new_s < 0.5f) new_s = my_s + (0.5f - my_s) * 0.01f; /* gentle restore */
+    /* Saturation floor: prevent graying out — keep colors vivid */
+    if (new_s < COMPLEMENT_MIN_SATURATION) new_s = my_s + (COMPLEMENT_MIN_SATURATION - my_s) * 0.02f;
 
     float3 rgb = hsv_to_rgb_full(new_h, new_s, my_v);
 
@@ -1395,13 +1629,23 @@ __global__ void grad_norm_kernel(const float* g, int n, float inv_n, float* d_gn
     atomicAdd(d_gnorm, v * v);
 }
 
-/* SGD with gradient clipping: if global norm > clip, scale all grads down */
-__global__ void sgd_step_kernel(float* w, float* g, int n, float lr, float inv_n,
-                                 float clip_scale) {
+/* Adam optimizer with gradient clipping.
+   m[i] and v[i] are the first and second moment estimates; they persist across
+   steps.  bc1 = 1/(1-beta1^t) and bc2 = 1/(1-beta2^t) are bias-correction
+   factors computed on the host.  Clears g[i] after applying the update so the
+   gradient accumulation buffer is ready for the next window. */
+__global__ void adam_step_kernel(float* w, float* g, float* m, float* v, int n,
+                                  float lr, float inv_n, float clip_scale,
+                                  float beta1, float beta2, float eps,
+                                  float bc1, float bc2) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float grad = g[i] * inv_n * clip_scale;
-    w[i] -= lr * grad;
+    m[i] = beta1 * m[i] + (1.0f - beta1) * grad;
+    v[i] = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    float m_hat = m[i] * bc1;
+    float v_hat = v[i] * bc2;
+    w[i] -= lr * m_hat / (sqrtf(v_hat) + eps);
     g[i] = 0.0f;
 }
 
@@ -1983,7 +2227,7 @@ static void process_live_controls(LiveTunables* t, int* params_dirty, int* reque
         if (t->gravity < 0.0f) t->gravity = 0.0f;
         if (t->gravity > 0.02f) t->gravity = 0.02f;
         if (t->lr < 0.000001f) t->lr = 0.000001f;
-        if (t->lr > 0.005f) t->lr = 0.005f;
+        if (t->lr > 0.01f) t->lr = 0.01f;
         if (t->triad < 0.0f) t->triad = 0.0f;
         if (t->triad > 0.5f) t->triad = 0.5f;
     }
@@ -1998,6 +2242,7 @@ static int parse_args(int argc, char** argv, HostOptions* opt) {
     opt->snap_every = 0;
     opt->snap_dir[0] = '\0';
     opt->resume_path[0] = '\0';
+    opt->nca_weights_path[0] = '\0';
     opt->quantum_log[0] = '\0';
 
     for (int i = 1; i < argc; ++i) {
@@ -2022,6 +2267,9 @@ static int parse_args(int argc, char** argv, HostOptions* opt) {
         } else if (!strcmp(argv[i], "--resume") && i + 1 < argc) {
             strncpy(opt->resume_path, argv[++i], sizeof(opt->resume_path) - 1);
             opt->resume_path[sizeof(opt->resume_path) - 1] = '\0';
+        } else if (!strcmp(argv[i], "--nca-weights") && i + 1 < argc) {
+            strncpy(opt->nca_weights_path, argv[++i], sizeof(opt->nca_weights_path) - 1);
+            opt->nca_weights_path[sizeof(opt->nca_weights_path) - 1] = '\0';
         }
     }
 
@@ -2035,6 +2283,56 @@ static void write_nca_weights(const char* path, const float* h_w, int n) {
     if (!f) return;
     fwrite(h_w, sizeof(float), (size_t)n, f);
     fclose(f);
+}
+
+/* NCA training checkpoint: weights + Adam first/second moments + step counter.
+   Format: 4-byte magic 0x4E434143 ("NCAC") | int32 n | int32 adam_t |
+           n floats w | n floats m | n floats v                              */
+static void write_nca_checkpoint(const char* path,
+                                  const float* h_w, const float* h_m,
+                                  const float* h_v, int adam_t, int n) {
+    FILE* f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "nca_checkpoint: cannot open %s for write\n", path); return; }
+    uint32_t magic = 0x4E434143u; /* ASCII "NCAC" — NCA Checkpoint */
+    int32_t  ni    = (int32_t)n;
+    int32_t  at    = (int32_t)adam_t;
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(&ni,    sizeof(ni),    1, f);
+    fwrite(&at,    sizeof(at),    1, f);
+    fwrite(h_w,    sizeof(float), (size_t)n, f);
+    fwrite(h_m,    sizeof(float), (size_t)n, f);
+    fwrite(h_v,    sizeof(float), (size_t)n, f);
+    fclose(f);
+}
+
+/* Returns 0 on success and fills h_w, h_m, h_v, *adam_t_out.
+   Returns -1 if the file is missing, corrupt, or has the wrong n. */
+static int load_nca_checkpoint(const char* path,
+                                float* h_w, float* h_m,
+                                float* h_v, int* adam_t_out, int n) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    uint32_t magic = 0;
+    int32_t  ni    = 0;
+    int32_t  at    = 0;
+    if (fread(&magic, sizeof(magic), 1, f) != 1 ||
+        fread(&ni,    sizeof(ni),    1, f) != 1 ||
+        fread(&at,    sizeof(at),    1, f) != 1 ||
+        magic != 0x4E434143u || ni != (int32_t)n) {
+        fprintf(stderr, "nca_checkpoint: invalid or incompatible checkpoint %s\n", path);
+        fclose(f);
+        return -1;
+    }
+    if (fread(h_w, sizeof(float), (size_t)n, f) != (size_t)n ||
+        fread(h_m, sizeof(float), (size_t)n, f) != (size_t)n ||
+        fread(h_v, sizeof(float), (size_t)n, f) != (size_t)n) {
+        fprintf(stderr, "nca_checkpoint: truncated checkpoint %s\n", path);
+        fclose(f);
+        return -1;
+    }
+    *adam_t_out = (int)at;
+    fclose(f);
+    return 0;
 }
 
 typedef struct {
@@ -2292,7 +2590,7 @@ int main(int argc, char** argv) {
     tune.feedback = BASE_FEEDBACK;
     tune.gravity = BASE_GRAVITY;
     tune.lr = BASE_LR;
-    tune.triad = 0.03f;
+    tune.triad = 0.06f;   /* wider default — clearly visible complement attraction/repulsion */
     tune.paused = 0;
     tune.step_once = 0;
 
@@ -2396,7 +2694,8 @@ int main(int argc, char** argv) {
     FILE* f_act = fopen("activations.csv", "a");
     FILE* f_energy = fopen("energy.csv", "a");
     FILE* f_de = fopen("delta_energy.csv", "a");
-    if (!f_act || !f_energy || !f_de) {
+    FILE* f_nca = fopen("nca_training.csv", "a");
+    if (!f_act || !f_energy || !f_de || !f_nca) {
         fprintf(stderr, "failed opening csv outputs\n");
         return 1;
     }
@@ -2404,24 +2703,88 @@ int main(int argc, char** argv) {
     if (ftell(f_act) == 0) fprintf(f_act, "tick,active\n");
     if (ftell(f_energy) == 0) fprintf(f_energy, "tick,wave_energy\n");
     if (ftell(f_de) == 0) fprintf(f_de, "tick,delta_energy\n");
+    if (ftell(f_nca) == 0) fprintf(f_nca, "tick,adam_step,nca_loss,nca_residual,grad_norm\n");
 
     float* nca_w = (float*)malloc(NCA_PARAMS * sizeof(float));
+    float* nca_m = (float*)malloc(NCA_PARAMS * sizeof(float));  /* host mirror of d_m */
+    float* nca_v = (float*)malloc(NCA_PARAMS * sizeof(float));  /* host mirror of d_v */
     float* nca_g = (float*)malloc(NCA_PARAMS * sizeof(float));
-    if (!nca_w || !nca_g) return 1;
+    if (!nca_w || !nca_m || !nca_v || !nca_g) return 1;
     memset(nca_g, 0, NCA_PARAMS * sizeof(float));
+    memset(nca_m, 0, NCA_PARAMS * sizeof(float));
+    memset(nca_v, 0, NCA_PARAMS * sizeof(float));
 
+    /* He (Kaiming) initialization for ReLU layers.
+       For a uniform distribution U[-a, a], variance = a²/3.  To achieve He's
+       target variance of 2/fan_in (for ReLU), we need a = sqrt(6/fan_in).
+       This differs from the normal-distribution formulation (std = sqrt(2/fan_in))
+       but is mathematically equivalent.
+       W1: fan_in = NCA_IN  → a = sqrt(6/NCA_IN) ≈ 0.21
+       W2: fan_in = NCA_H   → a = sqrt(6/NCA_H)  ≈ 0.43
+       b1: small positive constant (0.01) to break dead-ReLU symmetry at init
+       b2: zero */
+    float w1_scale = sqrtf(6.0f / (float)NCA_IN);
+    float w2_scale = sqrtf(6.0f / (float)NCA_H);
+    /* Fixed xorshift seed for He init — deterministic NCA starting point regardless
+       of the simulation seed so weight init is reproducible across runs.  The
+       simulation randomness (pixel/wave seeds) is controlled separately by --seed. */
     uint32_t rs = 0xCAFED00Du;
     for (int i = 0; i < NCA_PARAMS; ++i) {
         rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5;
-        nca_w[i] = (((float)(rs & 0xFFFFu) / 65535.0f) - 0.5f) * 0.02f;
+        float rnd = ((float)(rs & 0xFFFFu) / 65535.0f) - 0.5f;  /* [-0.5, 0.5) */
+        if (i < NCA_W1) {
+            nca_w[i] = rnd * 2.0f * w1_scale;
+        } else if (i < NCA_W1 + NCA_B1) {
+            nca_w[i] = 0.01f;   /* small positive bias — keeps ReLUs alive at init */
+        } else if (i < NCA_W1 + NCA_B1 + NCA_W2) {
+            nca_w[i] = rnd * 2.0f * w2_scale;
+        } else {
+            nca_w[i] = 0.0f;    /* output biases zero */
+        }
     }
 
     float* d_w = NULL;
     float* d_g = NULL;
+    float* d_m = NULL;   /* Adam first moment  (momentum) */
+    float* d_v = NULL;   /* Adam second moment (RMS estimate) */
+    int    adam_t = 0;   /* Adam step counter for bias correction */
     CHECK_CUDA(cudaMalloc(&d_w, NCA_PARAMS * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_g, NCA_PARAMS * sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(d_w, nca_w, NCA_PARAMS * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMalloc(&d_m, NCA_PARAMS * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_v, NCA_PARAMS * sizeof(float)));
     CHECK_CUDA(cudaMemset(d_g, 0, NCA_PARAMS * sizeof(float)));
+
+    /* Load NCA checkpoint if requested (--nca-weights) or if a companion
+       nca_checkpoint_<tick>.bin exists alongside the --resume snapshot.
+       Priority: explicit --nca-weights arg > auto-discovered companion file. */
+    {
+        char ckpt_path[512] = "";
+        if (opt.nca_weights_path[0]) {
+            strncpy(ckpt_path, opt.nca_weights_path, sizeof(ckpt_path) - 1);
+        } else if (opt.resume_path[0]) {
+            /* Replace ".bin" suffix with "_nca.bin" to find the companion file.
+               E.g. "checkpoint_65536.bin" → "checkpoint_65536_nca.bin"        */
+            strncpy(ckpt_path, opt.resume_path, sizeof(ckpt_path) - 1);
+            char* dot = strrchr(ckpt_path, '.');
+            if (dot) *dot = '\0';
+            strncat(ckpt_path, "_nca.bin", sizeof(ckpt_path) - strlen(ckpt_path) - 1);
+        }
+        int loaded = 0;
+        if (ckpt_path[0]) {
+            if (load_nca_checkpoint(ckpt_path, nca_w, nca_m, nca_v, &adam_t, NCA_PARAMS) == 0) {
+                fprintf(stderr, "[nca] loaded checkpoint %s (adam_t=%d)\n", ckpt_path, adam_t);
+                loaded = 1;
+            } else if (opt.nca_weights_path[0]) {
+                fprintf(stderr, "[nca] WARNING: --nca-weights %s failed to load; starting fresh\n",
+                        ckpt_path);
+            }
+        }
+        (void)loaded;
+    }
+
+    CHECK_CUDA(cudaMemcpy(d_w, nca_w, NCA_PARAMS * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_m, nca_m, NCA_PARAMS * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_v, nca_v, NCA_PARAMS * sizeof(float), cudaMemcpyHostToDevice));
 
     unsigned long long* d_active = NULL;
     float* d_wave_energy = NULL;
@@ -2544,6 +2907,22 @@ int main(int argc, char** argv) {
             CHECK_CUDA(cudaGetLastError());
         }
 
+        /* Collide (destructive) interference — wave zero-crossings flip pixel
+           toward its complement.  This is the entropy mechanism that keeps the
+           system from settling into stable attractors.  Fires whenever two waves
+           collide and cancel, disrupting whatever cluster structure is present. */
+        for (int sid = 0; sid < MAX_SUBSTRATES; ++sid) {
+            if (!pool.s[sid].active) continue;
+            Plane* p = &pool.s[sid].p;
+            collide_interference_kernel<<<grid, block, 0, stream0>>>(
+                p->wave_curr, p->wave_pitch,
+                p->wave_prev, p->wave_pitch,
+                p->pixel_curr, p->pixel_pitch,
+                p->pixel_next, p->pixel_pitch,
+                WIDTH, HEIGHT, tune.kwtp * COLLIDE_STRENGTH_MULT);
+        }
+        CHECK_CUDA(cudaGetLastError());
+
         /* Complementary neighbor force — Mexican hat on hue wheel.
            Exact opposite attracts, one-shade-off repels. */
         if (tune.triad != 0.0f) {
@@ -2586,7 +2965,7 @@ int main(int argc, char** argv) {
                         p->pixel_curr, p->pixel_pitch,
                         p->pixel_next, p->pixel_pitch,
                         d_xor_buf, h_xor_count,
-                        0.02f, WIDTH, HEIGHT);
+                        0.04f, WIDTH, HEIGHT);
                 }
             }
             CHECK_CUDA(cudaGetLastError());
@@ -2646,10 +3025,12 @@ int main(int argc, char** argv) {
                 WIDTH, HEIGHT, tune.gravity, 2, 2.0f);
         }
 
-        CHECK_CUDA(cudaMemsetAsync(d_g, 0, NCA_PARAMS * sizeof(float), stream0));
+        /* d_g is zeroed inside adam_step_kernel at the end of each update step.
+           No separate memset needed — the Adam kernel handles it, and the initial
+           cudaMemset at allocation primes the very first accumulation window. */
 
-        /* Comb + NCA per open substrate — NCA runs every 4 ticks to save compute */
-        if ((tick % 4) == 0) for (int sid = 0; sid < MAX_SUBSTRATES; ++sid) {
+        /* Comb + NCA forward/backward every NCA_FWD_PERIOD ticks */
+        if ((tick % NCA_FWD_PERIOD) == 0) for (int sid = 0; sid < MAX_SUBSTRATES; ++sid) {
             if (!pool.s[sid].active) continue;
             Plane* p = &pool.s[sid].p;
 
@@ -2698,22 +3079,34 @@ int main(int argc, char** argv) {
             p->ring_head = (p->ring_head + 1) % HIST_TICKS;
         }
 
-        if ((tick % 4) == 0) {
+        /* Adam weight update: fires every NCA_UPDATE_PERIOD ticks.
+           By this point NCA_UPDATE_PERIOD/NCA_FWD_PERIOD backward passes have
+           been accumulated into d_g, giving a larger effective batch. */
+        if ((tick % NCA_UPDATE_PERIOD) == 0) {
             int pb = 256;
             int pg = (NCA_PARAMS + pb - 1) / pb;
 
-            /* Gradient clipping: compute global norm, scale down if > 1.0 */
+            /* Global gradient norm for clipping */
             #define GRAD_CLIP 1.0f
             CHECK_CUDA(cudaMemsetAsync(d_gnorm, 0, sizeof(float), stream0));
-            grad_norm_kernel<<<pg, pb, 0, stream0>>>(d_g, NCA_PARAMS, 1.0f / (float)CELLS, d_gnorm);
+            /* Normalise by total accumulated samples:
+               NCA_ACCUMULATIONS backward passes × CELLS samples each */
+            float n_acc = (float)NCA_ACCUMULATIONS * (float)CELLS;
+            grad_norm_kernel<<<pg, pb, 0, stream0>>>(d_g, NCA_PARAMS, 1.0f / n_acc, d_gnorm);
             CHECK_CUDA(cudaStreamSynchronize(stream0));
             float h_gnorm = 0.0f;
             CHECK_CUDA(cudaMemcpy(&h_gnorm, d_gnorm, sizeof(float), cudaMemcpyDeviceToHost));
             float gnorm = sqrtf(h_gnorm);
             float clip_scale = (gnorm > GRAD_CLIP) ? (GRAD_CLIP / gnorm) : 1.0f;
 
-            sgd_step_kernel<<<pg, pb, 0, stream0>>>(d_w, d_g, NCA_PARAMS, tune.lr,
-                                                     1.0f / (float)CELLS, clip_scale);
+            /* Adam step with bias correction */
+            adam_t++;
+            float bc1 = 1.0f / (1.0f - powf(ADAM_BETA1, (float)adam_t));
+            float bc2 = 1.0f / (1.0f - powf(ADAM_BETA2, (float)adam_t));
+            adam_step_kernel<<<pg, pb, 0, stream0>>>(d_w, d_g, d_m, d_v, NCA_PARAMS,
+                                                      tune.lr, 1.0f / n_acc, clip_scale,
+                                                      ADAM_BETA1, ADAM_BETA2, ADAM_EPS,
+                                                      bc1, bc2);
             dash.grad_norm = gnorm;
         }
 
@@ -2858,6 +3251,22 @@ int main(int argc, char** argv) {
             char nname[128];
             snprintf(nname, sizeof(nname), "nca_weights_%d.bin", tick);
             write_nca_weights(nname, nca_w, NCA_PARAMS);
+
+            /* Full NCA checkpoint (weights + Adam moments + step counter) so
+               a resume with --resume checkpoint_NNN.bin + auto-discovered
+               companion _nca.bin restores training state exactly. */
+            CHECK_CUDA(cudaMemcpy(nca_m, d_m, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(nca_v, d_v, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+            char cname[128];
+            snprintf(cname, sizeof(cname), "checkpoint_%d_nca.bin", tick);
+            write_nca_checkpoint(cname, nca_w, nca_m, nca_v, adam_t, NCA_PARAMS);
+
+            /* Substrate state checkpoint — allows resuming physics too */
+            char sname[128];
+            snprintf(sname, sizeof(sname), "checkpoint_%d.bin", tick);
+            save_snapshot(sname, &pool, (uint64_t)tick);
+            fprintf(stderr, "[checkpoint] tick=%d  substrate → %s  nca → %s\n",
+                    tick, sname, cname);
         }
 
         /* Stats + observability */
@@ -2897,6 +3306,12 @@ int main(int argc, char** argv) {
         fprintf(f_act, "%d,%llu\n", tick, (unsigned long long)h_active);
         fprintf(f_energy, "%d,%.9g\n", tick, h_we);
         fprintf(f_de, "%d,%.9g\n", tick, h_de);
+        /* Write NCA training record on Adam update ticks so the CSV reflects
+           actual optimizer steps rather than every simulation tick. */
+        if ((tick % NCA_UPDATE_PERIOD) == 0) {
+            fprintf(f_nca, "%d,%d,%.9g,%.9g,%.6g\n",
+                    tick, adam_t, h_nca_loss, h_nca_res, dash.grad_norm);
+        }
 
         /* Update dashboard state */
         dash.tick          = tick;
@@ -2955,7 +3370,7 @@ int main(int argc, char** argv) {
             int period = (opt.snap_every > 0) ? opt.snap_every : SNAPSHOT_PERIOD;
             if ((tick % period) == 0) {
                 snapshot_png(&pool.s[1], (uint64_t)tick, opt.snap_dir);
-                fflush(f_act); fflush(f_energy); fflush(f_de);
+                fflush(f_act); fflush(f_energy); fflush(f_de); fflush(f_nca);
             }
         }
 
@@ -2978,11 +3393,21 @@ int main(int argc, char** argv) {
 
     save_snapshot("snapshot_final.bin", &pool, (uint64_t)opt.ticks);
 
-    fclose(f_act); fclose(f_energy); fclose(f_de);
+    /* Final NCA checkpoint — same naming convention as periodic ones so
+       --resume snapshot_final.bin auto-discovers snapshot_final_nca.bin */
+    CHECK_CUDA(cudaMemcpy(nca_w, d_w, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(nca_m, d_m, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(nca_v, d_v, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
+    write_nca_checkpoint("snapshot_final_nca.bin", nca_w, nca_m, nca_v, adam_t, NCA_PARAMS);
+    fprintf(stderr, "[final] substrate → snapshot_final.bin  nca → snapshot_final_nca.bin\n");
+
+    fclose(f_act); fclose(f_energy); fclose(f_de); fclose(f_nca);
 
     free(h_edges);
     free(natural_log);
     free(nca_w);
+    free(nca_m);
+    free(nca_v);
     free(nca_g);
 
     cudaFree(d_src_views);
@@ -2993,6 +3418,8 @@ int main(int argc, char** argv) {
     cudaFree(d_pair_corr);
     cudaFree(d_w);
     cudaFree(d_g);
+    cudaFree(d_m);
+    cudaFree(d_v);
     cudaFree(d_active);
     cudaFree(d_wave_energy);
     cudaFree(d_delta_energy);
