@@ -323,6 +323,16 @@ static void init_freq_table(void) {
    per weight update (effective mini-batch over time). */
 #define NCA_FWD_PERIOD    4     /* run NCA forward + backward every N ticks */
 #define NCA_UPDATE_PERIOD 16    /* apply Adam step every N ticks (= 4 accumulations) */
+/* NCA_ACCUMULATIONS = number of backward passes accumulated per Adam update */
+#define NCA_ACCUMULATIONS (NCA_UPDATE_PERIOD / NCA_FWD_PERIOD)
+
+/* Chromatic saturation thresholds — shared across kernels */
+#define MIN_SATURATION_ACHROMATIC 0.05f  /* below this S, pixel is considered achromatic */
+#define GRAVITY_MIN_SATURATION    0.75f  /* pixel_gravity_kernel saturation floor */
+#define COMPLEMENT_MIN_SATURATION 0.70f  /* complementary_neighbor_kernel sat floor */
+#define FLIP_MIN_SATURATION       0.75f  /* xor_broadcast_kernel saturation during flip */
+#define COLLIDE_MIN_SATURATION    0.80f  /* collide_interference_kernel saturation boost */
+#define MIN_COLLIDE_MAGNITUDE     0.02f  /* minimum wave zero-crossing strength to act */
 
 #define CHECK_CUDA(x) do { \
     cudaError_t _e = (x); \
@@ -580,7 +590,7 @@ __global__ void xor_broadcast_kernel(
        r=g=b.  We skip the flip for near-achromatic pixels since they have no
        meaningful hue to preserve and adding a hue rotation to gray produces
        oversaturated color spikes. */
-    if (my_s < 0.05f) return;
+    if (my_s < MIN_SATURATION_ACHROMATIC) return;
 
     for (int s = 0; s < n; ++s) {
         float tr = xor_buf[s*5+0];
@@ -591,7 +601,7 @@ __global__ void xor_broadcast_kernel(
         /* Skip achromatic trigger colors */
         float t_v = fmaxf(tr, fmaxf(tg, tb));
         float t_mn = fminf(tr, fminf(tg, tb));
-        if ((t_v < 1e-6f) || ((t_v - t_mn) / t_v < 0.05f)) continue;
+        if ((t_v < 1e-6f) || (t_v > 1e-6f && (t_v - t_mn) / t_v < MIN_SATURATION_ACHROMATIC)) continue;
 
         /* --- Group A: pixels near the trigger hue (subject zone, within ~30°) --- */
         float dh_a = my_h - t_h;
@@ -625,7 +635,7 @@ __global__ void xor_broadcast_kernel(
     /* HSV complement flip: rotate hue by π × flip_amount, preserve saturation+value.
        This keeps colors vivid throughout the flip — no desaturation from RGB blending. */
     float flipped_h = my_h + flip * PI;
-    float new_s = fmaxf(my_s, 0.75f); /* keep saturated through the flip */
+    float new_s = fmaxf(my_s, FLIP_MIN_SATURATION); /* keep saturated through the flip */
     float3 flipped_rgb = hsv_to_rgb_full(flipped_h, new_s, my_v);
 
     float4 out = row_f4(px_nxt_base, px_nxt_pitch, y)[x];
@@ -1357,7 +1367,7 @@ __global__ void pixel_gravity_kernel(
         float new_h = my_h + hue_pull * inv;
         /* Keep saturation vivid — gravity must not desaturate */
         float new_s = my_s;
-        if (new_s < 0.75f) new_s = my_s + (0.75f - my_s) * 0.03f;
+        if (new_s < GRAVITY_MIN_SATURATION) new_s = my_s + (GRAVITY_MIN_SATURATION - my_s) * 0.03f;
         /* Gentle value averaging keeps brightness coherent in clusters */
         float new_v = clamp01(my_v + val_pull * inv * 0.25f);
 
@@ -1412,7 +1422,7 @@ __global__ void collide_interference_kernel(
         fmaxf(0.0f, -sign_prod_z)
     ) * (1.0f / 1.7320508f); /* /sqrt(3) → normalized to [0,1] per channel */
 
-    if (collide_mag < 0.02f) return; /* too weak — ignore */
+    if (collide_mag < MIN_COLLIDE_MAGNITUDE) return; /* too weak — ignore */
 
     float4 me = row_f4_const(px_cur_base, px_cur_pitch, y)[x];
     float my_h, my_s, my_v;
@@ -1420,7 +1430,7 @@ __global__ void collide_interference_kernel(
 
     /* Flip toward HSV complement (hue + π = 180°) — true complement, not RGB */
     float comp_h = my_h + 3.14159265f;
-    float flip_s = fmaxf(my_s, 0.80f); /* collide boosts saturation for vivid effect */
+    float flip_s = fmaxf(my_s, COLLIDE_MIN_SATURATION); /* collide boosts saturation for vivid effect */
     float3 comp_rgb = hsv_to_rgb_full(comp_h, flip_s, my_v);
 
     float w = fminf(1.0f, collide_mag * strength);
@@ -1515,7 +1525,7 @@ __global__ void complementary_neighbor_kernel(
     float new_h = my_h + hue_delta * strength;
     float new_s = clamp01(my_s + sat_delta * strength);
     /* Saturation floor: prevent graying out — keep colors vivid */
-    if (new_s < 0.70f) new_s = my_s + (0.70f - my_s) * 0.02f;
+    if (new_s < COMPLEMENT_MIN_SATURATION) new_s = my_s + (COMPLEMENT_MIN_SATURATION - my_s) * 0.02f;
 
     float3 rgb = hsv_to_rgb_full(new_h, new_s, my_v);
 
@@ -2646,9 +2656,13 @@ int main(int argc, char** argv) {
     memset(nca_g, 0, NCA_PARAMS * sizeof(float));
 
     /* He (Kaiming) initialization for ReLU layers.
-       W1: fan_in = NCA_IN  → uniform scale = sqrt(6/NCA_IN)
-       W2: fan_in = NCA_H   → uniform scale = sqrt(6/NCA_H)
-       b1: small positive constant (0.01) to break dead-ReLU symmetry
+       For a uniform distribution U[-a, a], variance = a²/3.  To achieve He's
+       target variance of 2/fan_in (for ReLU), we need a = sqrt(6/fan_in).
+       This differs from the normal-distribution formulation (std = sqrt(2/fan_in))
+       but is mathematically equivalent.
+       W1: fan_in = NCA_IN  → a = sqrt(6/NCA_IN) ≈ 0.21
+       W2: fan_in = NCA_H   → a = sqrt(6/NCA_H)  ≈ 0.43
+       b1: small positive constant (0.01) to break dead-ReLU symmetry at init
        b2: zero */
     float w1_scale = sqrtf(6.0f / (float)NCA_IN);
     float w2_scale = sqrtf(6.0f / (float)NCA_H);
@@ -2920,12 +2934,9 @@ int main(int argc, char** argv) {
                 WIDTH, HEIGHT, tune.gravity, 2, 2.0f);
         }
 
-        /* Zero gradient buffer at the start of each accumulation window
-           (every NCA_UPDATE_PERIOD ticks) so we accumulate cleanly across
-           NCA_UPDATE_PERIOD / NCA_FWD_PERIOD backward passes before updating. */
-        if ((tick % NCA_UPDATE_PERIOD) == NCA_FWD_PERIOD) {
-            CHECK_CUDA(cudaMemsetAsync(d_g, 0, NCA_PARAMS * sizeof(float), stream0));
-        }
+        /* d_g is zeroed inside adam_step_kernel at the end of each update step.
+           No separate memset needed — the Adam kernel handles it, and the initial
+           cudaMemset at allocation primes the very first accumulation window. */
 
         /* Comb + NCA forward/backward every NCA_FWD_PERIOD ticks */
         if ((tick % NCA_FWD_PERIOD) == 0) for (int sid = 0; sid < MAX_SUBSTRATES; ++sid) {
@@ -2988,8 +2999,8 @@ int main(int argc, char** argv) {
             #define GRAD_CLIP 1.0f
             CHECK_CUDA(cudaMemsetAsync(d_gnorm, 0, sizeof(float), stream0));
             /* Normalise by total accumulated samples:
-               NCA_UPDATE_PERIOD/NCA_FWD_PERIOD passes × CELLS samples each */
-            float n_acc = (float)(NCA_UPDATE_PERIOD / NCA_FWD_PERIOD) * (float)CELLS;
+               NCA_ACCUMULATIONS backward passes × CELLS samples each */
+            float n_acc = (float)NCA_ACCUMULATIONS * (float)CELLS;
             grad_norm_kernel<<<pg, pb, 0, stream0>>>(d_g, NCA_PARAMS, 1.0f / n_acc, d_gnorm);
             CHECK_CUDA(cudaStreamSynchronize(stream0));
             float h_gnorm = 0.0f;
