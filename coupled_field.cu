@@ -3231,16 +3231,18 @@ int main(int argc, char** argv) {
             CHECK_CUDA(cudaGetLastError());
 
             /* Save NCA model only when it improves — all instances share best_nca.bin */
-            if (dash.nca_loss > 0.0 && dash.nca_loss < best_nca_loss) {
+            if (dash.nca_loss >= 0.0 && dash.nca_loss < best_nca_loss) {
                 best_nca_loss = (float)dash.nca_loss;
                 CHECK_CUDA(cudaMemcpy(nca_w, d_w, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
                 CHECK_CUDA(cudaMemcpy(nca_m, d_m, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
                 CHECK_CUDA(cudaMemcpy(nca_v, d_v, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
                 /* Atomic write via temp file + rename so concurrent instances don't corrupt */
                 write_nca_checkpoint("best_nca.bin.tmp", nca_w, nca_m, nca_v, adam_t, NCA_PARAMS);
-                rename("best_nca.bin.tmp", "best_nca.bin");
-                fprintf(stderr, "[model] tick=%d  loss=%.6g (improved) → best_nca.bin\n",
-                        tick, best_nca_loss);
+                if (rename("best_nca.bin.tmp", "best_nca.bin") != 0)
+                    fprintf(stderr, "[model] warning: rename best_nca.bin.tmp failed\n");
+                else
+                    fprintf(stderr, "[model] tick=%d  loss=%.6g (improved) → best_nca.bin\n",
+                            tick, best_nca_loss);
             }
         }
 
@@ -3372,12 +3374,14 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMemcpy(nca_w, d_w, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(nca_m, d_m, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(nca_v, d_v, NCA_PARAMS * sizeof(float), cudaMemcpyDeviceToHost));
-    if (dash.nca_loss > 0.0 && dash.nca_loss < best_nca_loss) {
+    if (dash.nca_loss >= 0.0 && dash.nca_loss < best_nca_loss) {
         best_nca_loss = (float)dash.nca_loss;
         write_nca_checkpoint("best_nca.bin.tmp", nca_w, nca_m, nca_v, adam_t, NCA_PARAMS);
-        rename("best_nca.bin.tmp", "best_nca.bin");
-        fprintf(stderr, "[final] substrate → snapshot_final.bin  nca → best_nca.bin (loss=%.6g)\n",
-                best_nca_loss);
+        if (rename("best_nca.bin.tmp", "best_nca.bin") != 0)
+            fprintf(stderr, "[final] warning: rename best_nca.bin.tmp failed\n");
+        else
+            fprintf(stderr, "[final] substrate → snapshot_final.bin  nca → best_nca.bin (loss=%.6g)\n",
+                    best_nca_loss);
     } else {
         fprintf(stderr, "[final] substrate → snapshot_final.bin  nca unchanged (best_nca.bin loss=%.6g)\n",
                 best_nca_loss);
