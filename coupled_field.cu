@@ -98,6 +98,12 @@ typedef struct {
     int step_once;
 } LiveTunables;
 
+/* Forward declarations for HSV helpers used by kernels defined earlier in file. */
+__device__ __forceinline__ float3 hsv_to_rgb_full(float h, float s, float v);
+__device__ __forceinline__ void rgb_to_hsv_full(float r, float g, float b,
+                                                float* h, float* s, float* v);
+__device__ __forceinline__ float rgb_to_hue_rad(float r, float g, float b);
+
 static void draw_dashboard(const DashState* d) {
     const int cells_total = 1920 * 1080;
     double pct = (d->ticks_goal > 0) ? (d->tick * 100.0 / d->ticks_goal) : 0;
