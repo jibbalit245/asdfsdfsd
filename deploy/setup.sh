@@ -28,7 +28,7 @@ echo "Detected arch: $ARCH"
 _PROBE=$(mktemp /tmp/probe_XXXX.cu)
 echo "int main(){return 0;}" > "$_PROBE"
 if ! $NVCC -arch=$ARCH -o /dev/null "$_PROBE" 2>/dev/null; then
-    for FALLBACK in sm_90 sm_89 sm_86 sm_80; do
+    for FALLBACK in sm_120 sm_90 sm_89 sm_86 sm_80; do
         if $NVCC -arch=$FALLBACK -o /dev/null "$_PROBE" 2>/dev/null; then
             echo "WARNING: $ARCH not supported by this nvcc; falling back to $FALLBACK"
             ARCH=$FALLBACK
