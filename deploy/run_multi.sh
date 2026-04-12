@@ -1,9 +1,10 @@
 #!/bin/bash
 # run_multi.sh — launch one instance per GPU, different seeds
 # Detects how many GPUs are available and fills them up.
-# Usage: ./deploy/run_multi.sh [snap_every]
+# Usage: ./deploy/run_multi.sh [snap_every] [ticks]
 
-SNAP_EVERY=${1:-1}
+SNAP_EVERY=${1:-500}
+TICKS=${2:-500000}
 
 cd "$(dirname "$0")/.."
 
@@ -21,6 +22,7 @@ for i in $(seq 0 $((GPU_COUNT - 1))); do
 
     CUDA_VISIBLE_DEVICES=$i nohup ./coupled_field \
         --seed "$SEED" \
+        --ticks "$TICKS" \
         --snap-every "$SNAP_EVERY" \
         --snap-dir "$OUT" \
         --no-interactive \
