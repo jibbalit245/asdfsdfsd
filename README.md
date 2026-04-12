@@ -10,7 +10,8 @@ cd asdfsdfsd
 
 That's it. `start.sh` will:
 1. **Detect your GPU arch** and compile `coupled_field` (needs CUDA / `nvcc` on PATH)
-2. **Launch a 500 000-tick run** with default settings:
+2. **Launch one run per visible GPU** when 2+ GPUs are detected (`deploy/run_multi.sh`)
+3. If only 1 GPU is visible (or `MULTI_GPU=0`), it runs a **500 000-tick single-GPU long run** with:
    | Setting | Default |
    |---------|---------|
    | Seed | `random` |
@@ -32,6 +33,38 @@ RESUME=1 ./start.sh
 ```bash
 SEED=sparse OUT_DIR=./my_frames DEVICE=1 ./start.sh
 ```
+
+Force single-GPU mode even on multi-GPU hosts:
+
+```bash
+MULTI_GPU=0 ./start.sh
+```
+
+
+## RunPod / RTX 50xx troubleshooting
+
+If you are running on RunPod with RTX 5090 / 50xx GPUs and build fails with an
+architecture error (for example `unsupported gpu architecture`), use the updated
+`deploy/setup.sh` behavior:
+
+- It auto-detects compute capability when possible.
+- If your `nvcc` is too old for that exact `sm_XX`, it falls back to the newest
+  supported target and also emits PTX for forward-compat JIT.
+
+You can also force a specific architecture:
+
+```bash
+CUDA_ARCH=sm_90 ./deploy/setup.sh
+```
+
+Then run:
+
+```bash
+./start.sh
+```
+
+If `nvcc` is missing entirely on the pod image, install a CUDA toolkit image or
+switch to a RunPod template that includes CUDA compiler tools (not just drivers).
 
 ## Other scripts
 
