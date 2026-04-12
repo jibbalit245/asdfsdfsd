@@ -2293,7 +2293,7 @@ static void write_nca_checkpoint(const char* path,
                                   const float* h_v, int adam_t, int n) {
     FILE* f = fopen(path, "wb");
     if (!f) { fprintf(stderr, "nca_checkpoint: cannot open %s for write\n", path); return; }
-    uint32_t magic = 0x4E434143u;
+    uint32_t magic = 0x4E434143u; /* ASCII "NCAC" — NCA Checkpoint */
     int32_t  ni    = (int32_t)n;
     int32_t  at    = (int32_t)adam_t;
     fwrite(&magic, sizeof(magic), 1, f);
@@ -2725,6 +2725,9 @@ int main(int argc, char** argv) {
        b2: zero */
     float w1_scale = sqrtf(6.0f / (float)NCA_IN);
     float w2_scale = sqrtf(6.0f / (float)NCA_H);
+    /* Fixed xorshift seed for He init — deterministic NCA starting point regardless
+       of the simulation seed so weight init is reproducible across runs.  The
+       simulation randomness (pixel/wave seeds) is controlled separately by --seed. */
     uint32_t rs = 0xCAFED00Du;
     for (int i = 0; i < NCA_PARAMS; ++i) {
         rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5;

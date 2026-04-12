@@ -27,10 +27,23 @@ mkdir -p "$OUT_DIR"
 
 RESUME_ARGS=""
 if [ "${RESUME:-0}" = "1" ]; then
-    # Find the latest periodic checkpoint
-    LATEST=$(ls -t checkpoint_*.bin 2>/dev/null | grep -v '_nca' | head -1)
+    # Find the latest periodic checkpoint using a glob and sort numerically on the tick number
+    LATEST=""
+    LATEST_TICK=-1
+    for f in checkpoint_*.bin; do
+        # Skip NCA companion files
+        case "$f" in *_nca.bin) continue ;; esac
+        # Extract tick number from checkpoint_NNN.bin
+        tick="${f#checkpoint_}"
+        tick="${tick%.bin}"
+        case "$tick" in ''|*[!0-9]*) continue ;; esac
+        if [ "$tick" -gt "$LATEST_TICK" ] 2>/dev/null; then
+            LATEST_TICK=$tick
+            LATEST=$f
+        fi
+    done
     if [ -n "$LATEST" ]; then
-        echo "=== Resuming from: $LATEST ==="
+        echo "=== Resuming from: $LATEST (tick $LATEST_TICK) ==="
         RESUME_ARGS="--resume $LATEST"
         # NCA companion file is auto-discovered by the binary (strips .bin, appends _nca.bin)
     else
