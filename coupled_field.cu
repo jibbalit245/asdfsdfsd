@@ -299,6 +299,11 @@ static void init_freq_table(void) {
 #define DEFAULT_SUBSTRATES 2
 #define MAX_CANDIDATES 262144
 
+/* Collide-interference strength multiplier: kwtp × this factor determines
+   how strongly destructive wave zero-crossings flip pixels toward complement.
+   Higher = more entropy/chaos; lower = slower complementary disruption. */
+#define COLLIDE_STRENGTH_MULT 2.0f
+
 #define BASE_C2 0.18f
 #define BASE_DAMPING 0.9998f
 #define BASE_DRIVE 0.002f       /* increased: stronger hue-frequency injection into wave */
@@ -559,12 +564,22 @@ __global__ void xor_broadcast_kernel(
     const float PI = 3.14159265358979f;
     float hue_flip_weight = 0.0f;
 
+    /* Guard against achromatic (gray) pixels — rgb_to_hue_rad returns 0 for
+       r=g=b.  We skip the flip for near-achromatic pixels since they have no
+       meaningful hue to preserve and adding a hue rotation to gray produces
+       oversaturated color spikes. */
+    if (my_s < 0.05f) return;
+
     for (int s = 0; s < n; ++s) {
         float tr = xor_buf[s*5+0];
         float tg = xor_buf[s*5+1];
         float tb = xor_buf[s*5+2];
         float xstr = xor_buf[s*5+4];
         float t_h = rgb_to_hue_rad(tr, tg, tb);
+        /* Skip achromatic trigger colors */
+        float t_v = fmaxf(tr, fmaxf(tg, tb));
+        float t_mn = fminf(tr, fminf(tg, tb));
+        if ((t_v < 1e-6f) || ((t_v - t_mn) / t_v < 0.05f)) continue;
 
         /* --- Group A: pixels near the trigger hue (subject zone, within ~30°) --- */
         float dh_a = my_h - t_h;
@@ -1304,17 +1319,19 @@ __global__ void collide_interference_kernel(
     float4 wv_prev = row_f4_const(wv_prev_base, wv_prev_pitch, y)[x];
 
     /* Detect sign change (zero crossing) in any wave channel.
-       Magnitude of crossing = product of old and new amplitude (negative when signs differ). */
-    float cross_x = wv_prev.x * wv_cur.x;
-    float cross_y = wv_prev.y * wv_cur.y;
-    float cross_z = wv_prev.z * wv_cur.z;
+       sign_prod < 0 means prev and curr had opposite signs → zero crossing.
+       Magnitude contribution is sqrt(|prev * curr|) — proportional to the
+       amplitudes at the crossing, favouring high-energy collisions. */
+    float sign_prod_x = wv_prev.x * wv_cur.x;
+    float sign_prod_y = wv_prev.y * wv_cur.y;
+    float sign_prod_z = wv_prev.z * wv_cur.z;
 
-    /* Collide event: any channel crossed zero with significant amplitude */
-    float collide_mag = 0.0f;
-    if (cross_x < 0.0f) collide_mag += sqrtf(-cross_x);
-    if (cross_y < 0.0f) collide_mag += sqrtf(-cross_y);
-    if (cross_z < 0.0f) collide_mag += sqrtf(-cross_z);
-    collide_mag *= (1.0f / 3.0f);
+    /* Collide event: sum sqrts of crossing magnitudes across channels */
+    float collide_mag = sqrtf(
+        fmaxf(0.0f, -sign_prod_x) +
+        fmaxf(0.0f, -sign_prod_y) +
+        fmaxf(0.0f, -sign_prod_z)
+    ) * (1.0f / 1.7320508f); /* /sqrt(3) → normalized to [0,1] per channel */
 
     if (collide_mag < 0.02f) return; /* too weak — ignore */
 
@@ -2683,7 +2700,7 @@ int main(int argc, char** argv) {
                 p->wave_prev, p->wave_pitch,
                 p->pixel_curr, p->pixel_pitch,
                 p->pixel_next, p->pixel_pitch,
-                WIDTH, HEIGHT, tune.kwtp * 2.0f);
+                WIDTH, HEIGHT, tune.kwtp * COLLIDE_STRENGTH_MULT);
         }
         CHECK_CUDA(cudaGetLastError());
 
