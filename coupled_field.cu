@@ -188,7 +188,7 @@ static void draw_dashboard(const DashState* d) {
 
 /*
 Build:
-  nvcc -O3 -arch=sm_120 -use_fast_math -lineinfo -o coupled_field coupled_field.cu
+  nvcc -O3 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120,code=sm_120 -use_fast_math -lineinfo -o coupled_field coupled_field.cu
 
 Quantum seed:
   ./coupled_field --seed quantum C:/Users/jwest/.gemini/antigravity/scratch/SHA256_Analyzer/quantum_seeds.log
