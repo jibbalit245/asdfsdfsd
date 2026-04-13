@@ -192,6 +192,56 @@ static void draw_dashboard(const DashState* d) {
     fflush(stdout);
 }
 
+/* Write a small JSON status file so deploy/monitor.sh can read it.
+   Uses write-to-tmp + rename for atomic updates. */
+static void write_status_json(const DashState* d, const char* snap_dir) {
+    char tmp_path[640], final_path[640];
+    if (snap_dir && snap_dir[0]) {
+        snprintf(tmp_path,   sizeof(tmp_path),   "%s/status.json.tmp", snap_dir);
+        snprintf(final_path, sizeof(final_path), "%s/status.json",     snap_dir);
+    } else {
+        snprintf(tmp_path,   sizeof(tmp_path),   "status.json.tmp");
+        snprintf(final_path, sizeof(final_path), "status.json");
+    }
+    FILE* f = fopen(tmp_path, "w");
+    if (!f) return;
+    fprintf(f,
+        "{\n"
+        "  \"device\": \"%s\",\n"
+        "  \"tick\": %d,\n"
+        "  \"ticks_goal\": %d,\n"
+        "  \"active_cells\": %llu,\n"
+        "  \"wave_energy\": %.9g,\n"
+        "  \"delta_energy\": %.9g,\n"
+        "  \"edge_count\": %d,\n"
+        "  \"natural_count\": %d,\n"
+        "  \"snapshots\": %d,\n"
+        "  \"nca_loss\": %.9g,\n"
+        "  \"nca_residual\": %.9g,\n"
+        "  \"grad_norm\": %.6g,\n"
+        "  \"tick_ms\": %.3f,\n"
+        "  \"alerts\": %d,\n"
+        "  \"paused\": %d\n"
+        "}\n",
+        d->device_name,
+        d->tick,
+        d->ticks_goal,
+        (unsigned long long)d->active_cells,
+        d->wave_energy,
+        d->delta_energy,
+        d->edge_count,
+        d->natural_count,
+        d->snapshots,
+        d->nca_loss,
+        d->nca_residual,
+        (double)d->grad_norm,
+        (double)d->tick_ms,
+        d->alerts,
+        d->paused);
+    fclose(f);
+    rename(tmp_path, final_path);
+}
+
 /*
 Build:
   nvcc -O3 -arch=sm_120 -use_fast_math -lineinfo -o coupled_field coupled_field.cu
@@ -2867,7 +2917,7 @@ int main(int argc, char** argv) {
                 dash.tune_lr = tune.lr;
                 dash.tune_triad = tune.triad;
                 draw_dashboard(&dash);
-                cli_sleep_ms(16);
+                write_status_json(&dash, opt.snap_dir);
                 tick -= 1;
                 continue;
             }
@@ -3337,6 +3387,7 @@ int main(int argc, char** argv) {
         }
 
         draw_dashboard(&dash);
+        write_status_json(&dash, opt.snap_dir);
 
         no_new_ent_ticks += 1;
         if (no_new_ent_ticks >= 100000) {

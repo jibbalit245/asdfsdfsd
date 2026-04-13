@@ -43,7 +43,10 @@ done
 
 echo ""
 echo "All instances launched. Each writes to best_nca.bin when loss improves."
-echo "Monitor with:"
+echo "Monitor all instances live with:"
+echo "  ./deploy/monitor.sh"
+echo ""
+echo "Quick frame count:"
 echo "  watch -n 2 'for d in frames_gpu*/; do echo \"\$d: \$(ls \$d/*.png 2>/dev/null | wc -l) frames\"; done'"
 echo ""
 echo "Stop all:  pkill coupled_field"
