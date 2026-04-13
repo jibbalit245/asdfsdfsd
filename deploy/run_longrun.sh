@@ -1,19 +1,15 @@
 #!/bin/bash
-# run_longrun.sh — 500,000-tick training run with full checkpoint/resume support
+# run_longrun.sh — 500,000-tick training run with checkpoint/resume support
 #
 # Usage:
 #   ./deploy/run_longrun.sh [seed] [out_dir] [device]
 #
-# To resume from the latest checkpoint:
+# To resume from the latest substrate snapshot:
 #   RESUME=1 ./deploy/run_longrun.sh [seed] [out_dir] [device]
 #
-# Checkpoints are written every 65,536 ticks:
-#   checkpoint_65536.bin        — substrate state (pixel + wave)
-#   checkpoint_65536_nca.bin    — NCA weights + Adam moments + step counter
-#
-# On resume (RESUME=1), the script finds the latest checkpoint_NNN.bin and
-# passes both --resume and (implicitly via auto-discovery) --nca-weights.
-# The auto-discovery looks for snapshot_path_nca.bin, so naming matches.
+# NCA model is saved to best_nca.bin whenever loss improves.
+# All instances (including multi-GPU) share the same best_nca.bin file.
+# When RESUME=1, best_nca.bin is loaded via --nca-weights if present.
 
 SEED=${1:-random}
 OUT_DIR=${2:-./frames_longrun}
@@ -27,33 +23,17 @@ mkdir -p "$OUT_DIR"
 
 RESUME_ARGS=""
 if [ "${RESUME:-0}" = "1" ]; then
-    # Find the latest periodic checkpoint using a glob and sort numerically on the tick number
-    LATEST=""
-    LATEST_TICK=-1
-    for f in checkpoint_*.bin; do
-        # Skip NCA companion files
-        case "$f" in *_nca.bin) continue ;; esac
-        # Extract tick number from checkpoint_NNN.bin
-        tick="${f#checkpoint_}"
-        tick="${tick%.bin}"
-        case "$tick" in ''|*[!0-9]*) continue ;; esac
-        if [ "$tick" -gt "$LATEST_TICK" ] 2>/dev/null; then
-            LATEST_TICK=$tick
-            LATEST=$f
-        fi
-    done
-    if [ -n "$LATEST" ]; then
-        echo "=== Resuming from: $LATEST (tick $LATEST_TICK) ==="
-        RESUME_ARGS="--resume $LATEST"
-        # NCA companion file is auto-discovered by the binary (strips .bin, appends _nca.bin)
+    # Resume substrate state from final snapshot if available
+    if [ -f snapshot_final.bin ]; then
+        echo "=== Resuming from: snapshot_final.bin ==="
+        RESUME_ARGS="--resume snapshot_final.bin"
     else
-        # Fall back to final snapshot if available
-        if [ -f snapshot_final.bin ]; then
-            echo "=== Resuming from: snapshot_final.bin ==="
-            RESUME_ARGS="--resume snapshot_final.bin"
-        else
-            echo "=== No checkpoint found; starting fresh ==="
-        fi
+        echo "=== No snapshot found; starting fresh ==="
+    fi
+    # Load best NCA model if available
+    if [ -f best_nca.bin ]; then
+        echo "=== Loading NCA model: best_nca.bin ==="
+        RESUME_ARGS="$RESUME_ARGS --nca-weights best_nca.bin"
     fi
 fi
 
@@ -78,6 +58,6 @@ CUDA_VISIBLE_DEVICES=$DEVICE ./coupled_field \
 echo ""
 echo "=== Run complete. Outputs: ==="
 echo "  Substrate  : snapshot_final.bin"
-echo "  NCA model  : snapshot_final_nca.bin"
+echo "  NCA model  : best_nca.bin  (saved only on improvement)"
 echo "  Training   : nca_training.csv"
 echo "  Frames     : $OUT_DIR/"
