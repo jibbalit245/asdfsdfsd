@@ -10,7 +10,8 @@ cd asdfsdfsd
 
 That's it. `start.sh` will:
 1. **Detect your GPU arch** and compile `coupled_field` (needs CUDA / `nvcc` on PATH)
-2. **Launch a 500 000-tick run** with default settings:
+2. **Launch one run per visible GPU** when 2+ GPUs are detected (`deploy/run_multi.sh`)
+3. If only 1 GPU is visible (or `MULTI_GPU=0`), it runs a **500 000-tick single-GPU long run** with:
    | Setting | Default |
    |---------|---------|
    | Seed | `random` |
