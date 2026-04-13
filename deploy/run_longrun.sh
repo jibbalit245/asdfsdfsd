@@ -9,7 +9,7 @@
 #
 # NCA model is saved to best_nca.bin whenever loss improves.
 # All instances (including multi-GPU) share the same best_nca.bin file.
-# Resume loads best_nca.bin automatically via --nca-weights if present.
+# When RESUME=1, best_nca.bin is loaded via --nca-weights if present.
 
 SEED=${1:-random}
 OUT_DIR=${2:-./frames_longrun}
