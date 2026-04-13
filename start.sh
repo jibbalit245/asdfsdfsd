@@ -21,4 +21,6 @@ fi
 # ── launch across all GPUs ────────────────────────────────────────────────────
 SNAP_EVERY=${SNAP_EVERY:-500}
 
-exec bash deploy/run_multi.sh "$SNAP_EVERY"
+bash deploy/run_multi.sh "$SNAP_EVERY"
+
+exec bash deploy/monitor.sh
